@@ -445,7 +445,6 @@ class DifferentiableRTM(nn.Module):
         
         return r_h, r_v, teff_h, teff_v
     
-    
 
     def eff_soil_temp_Lv_multi(self, dz_soi, t_soi, eps, lam):
         # Calculate effective temperature using Lv multi-layer discrete scheme
