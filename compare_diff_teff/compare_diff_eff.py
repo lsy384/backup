@@ -10,14 +10,10 @@ import matplotlib.pyplot as plt
 # Import the RTM model containing the added Teff schemes
 from rtm import DifferentiableRTM
 
-def main():
+def main(target_year, target_month, target_day, target_hour, output_dir):
     # ==========================================
     # TIME SETTING (Modify here for target slice)
     # ==========================================
-    target_year = 2016
-    target_month = 6
-    target_day = 1
-    target_hour = 0
 
     target_dt = datetime.datetime(target_year, target_month, target_day, target_hour)
     start_of_year = datetime.datetime(target_year, 1, 1)
@@ -119,83 +115,99 @@ def main():
     
     # Save CSV using the specified format YYYY-MM-DD-HH
     csv_filename = f"Teff_compare_{time_format_str}.csv"
-    final_df.to_csv(csv_filename, index=False)
+    final_df.to_csv(os.path.join(output_dir, csv_filename), index=False)
     print(f"Calculation finished successfully. Saved data table to: {csv_filename}\n")
 
-    # Expanded to 4 rows and 2 columns subplot layout (All 8 subplots are active)
+    # Expanded to 4 rows and 2 columns subplot layout
     fig, axs = plt.subplots(4, 2, figsize=(16, 22))
     
-    # Grid configurations mapping columns and references to positions
     plot_configs = [
-        # Row 1: Lv Multi-layer differences
-        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "row_idx": 0, "col_idx": 0, "is_temp": True, "v_lim": 5.0},
-        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_V", "title": "Lv Multi-layer - Wilheit (V)", "row_idx": 0, "col_idx": 1, "is_temp": True, "v_lim": 5.0},
-        # Row 2: Lv Two-layer differences
-        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_H", "title": "Lv Two-layer - Wilheit (H)", "row_idx": 1, "col_idx": 0, "is_temp": True, "v_lim": 5.0},
-        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_V", "title": "Lv Two-layer - Wilheit (V)", "row_idx": 1, "col_idx": 1, "is_temp": True, "v_lim": 5.0},
-        # Row 3: Wigneron 2001 differences
-        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "row_idx": 2, "col_idx": 0, "is_temp": True, "v_lim": 5.0},
-        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_V", "title": "Wigneron 2001 - Wilheit (V)", "row_idx": 2, "col_idx": 1, "is_temp": True, "v_lim": 5.0},
-        # Row 4: Internal discrepancies (Positions 7 and 8) with tight independent scales
-        {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "row_idx": 3, "col_idx": 0, "is_temp": True, "v_lim": None},
-        {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "row_idx": 3, "col_idx": 1, "is_temp": False, "v_lim": None}
+        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "row_idx": 0, "col_idx": 0, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_V", "title": "Lv Multi-layer - Wilheit (V)", "row_idx": 0, "col_idx": 1, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_H", "title": "Lv Two-layer - Wilheit (H)", "row_idx": 1, "col_idx": 0, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_V", "title": "Lv Two-layer - Wilheit (V)", "row_idx": 1, "col_idx": 1, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "row_idx": 2, "col_idx": 0, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_V", "title": "Wigneron 2001 - Wilheit (V)", "row_idx": 2, "col_idx": 1, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "row_idx": 3, "col_idx": 0, "is_temp": True, "is_unified": False},
+        {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "row_idx": 3, "col_idx": 1, "is_temp": False, "is_unified": False}
     ]
 
-    print("==================================================")
-    print(f" ERROR DISTRIBUTION ANALYSIS ({time_format_str})")
-    print("==================================================")
+    # Pre-calculate unified range for plots 1-6
+    global_max_abs = 0.0
+    for cfg in plot_configs:
+        if cfg["is_unified"]:
+            diff = final_df[cfg["col"]] - final_df[cfg["ref"]]
+            max_abs = max(abs(diff.min()), abs(diff.max()))
+            if max_abs > global_max_abs:
+                global_max_abs = max_abs
+    if global_max_abs == 0:
+        global_max_abs = 1e-4
+
+    # ==================================================
+    # CONSTRUCT SUMMARY TABLE & PLOT
+    # ==================================================
+    stats_list = []
 
     for cfg in plot_configs:
         diff = final_df[cfg["col"]] - final_df[cfg["ref"]]
         
-        # Statistically calculate error distributions metrics
         mean_bias = diff.mean()
         std_dev = diff.std()
         rmse_val = np.sqrt((diff ** 2).mean())
         min_diff = diff.min()
         max_diff = diff.max()
-        
-        # Format units based on physical quantities
         unit_str = "K" if cfg["is_temp"] else "-"
         
-        # Output current scheme stats to stdout log console
-        print(f"Scheme Profile: {cfg['title']}")
-        print(f"  Total Patches Evaluated : {len(diff)}")
-        print(f"  Mean Bias Error (MBE)   : {mean_bias:.4f} {unit_str}")
-        print(f"  Standard Deviation (SD) : {std_dev:.4f} {unit_str}")
-        print(f"  Root Mean Square (RMSE) : {rmse_val:.4f} {unit_str}")
-        print(f"  Minimum Discrepancy     : {min_diff:.4f} {unit_str}")
-        print(f"  Maximum Discrepancy     : {max_diff:.4f} {unit_str}")
-        print("-" * 50)
+        # 将单位作为独立列，使 CSV 结构更为规整
+        stats_list.append({
+            "Scheme Profile": cfg["title"],
+            "Total Patches": len(diff),
+            "Unit": unit_str,
+            "MBE": round(mean_bias, 4),
+            "SD": round(std_dev, 4),
+            "RMSE": round(rmse_val, 4),
+            "Min Diff": round(min_diff, 4),
+            "Max Diff": round(max_diff, 4)
+        })
         
-        # Route mapping to the correct location in the 4x2 matrix
+        # 绘图逻辑
         ax = axs[cfg["row_idx"], cfg["col_idx"]]
-        
-        # Configure local color limits
-        if cfg["v_lim"] is not None:
-            vmin, vmax = -cfg["v_lim"], cfg["v_lim"]
-        else:
-            # Dynamically calculate tight limits around zero for positions 7 and 8
-            max_abs = max(abs(min_diff), abs(max_diff))
-            if max_abs == 0:
-                max_abs = 1e-4
-            vmin, vmax = -max_abs, max_abs
+        vmin, vmax = (-global_max_abs, global_max_abs) if cfg["is_unified"] else (-max(abs(min_diff), abs(max_diff)) or -1e-4, max(abs(min_diff), abs(max_diff)) or 1e-4)
             
         sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
-                        c=diff, cmap='coolwarm', s=1, vmin=vmin, vmax=vmax)
+                        c=diff, cmap='coolwarm', s=1, vmin=-20, vmax=20)
         
-        # Format titles with high precision statistical tags
         ax.set_title(f"{cfg['title']}\n(RMSE: {rmse_val:.4f}{unit_str}, Bias: {mean_bias:.4f}{unit_str})")
         ax.set_ylabel('Latitude')
         ax.set_xlabel('Longitude')
-
         cb_label = 'T_eff Difference (K)' if cfg["is_temp"] else 'Reflectivity Difference (-)'
         plt.colorbar(sc, ax=ax, label=cb_label)
 
+    # 转换为统计 DataFrame
+    summary_df = pd.DataFrame(stats_list)
+    
+    # 终端打印展示
+    print("\n" + "="*80)
+    print(f" ERROR DISTRIBUTION SUMMARY TABLE ({time_format_str})")
+    print("="*80)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
+    print(summary_df.to_string(index=False))
+    print("="*80 + "\n")
+    
+    # 修改处：将误差统计结果保存为标准的 CSV 文件而不再是 XLSX
+    stats_csv_filename = f"Teff_stats_summary_{time_format_str}.csv"
+    summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
+    print(f"Statistics summary table successfully saved to CSV: {stats_csv_filename}")
+
     plt.tight_layout()
     plot_filename = f"Teff_diff_map_{time_format_str}.png"
-    plt.savefig(plot_filename, dpi=300)
-    print(f"\nSpatial discrepancy profile plot successfully generated: {plot_filename}")
+    plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
+    plt.close()
+    print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
 
 if __name__ == "__main__":
-    main()
+    
+    for m in range(1, 13):
+        main(2016, m, 1, 0, 
+            output_dir='/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results')
