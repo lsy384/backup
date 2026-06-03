@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import netCDF4 as nc
 import matplotlib.pyplot as plt
-
+import calendar
 # Import the RTM model containing the added Teff schemes
 from rtm import DifferentiableRTM
 
@@ -60,16 +60,25 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             lat = lat[valid_mask]
             patchclass = patchclass[valid_mask]
             
-            # Extract dynamic and depth-dependent variables
+            # 修改为以下内容：
             t_soisno = dataset.variables['t_soisno'][time_idx, valid_mask, :]
             wliq_soisno = dataset.variables['wliq_soisno'][time_idx, valid_mask, :]
             wf_clay = dataset.variables['wf_clay'][valid_mask, :]
             
+            # 尝试读取容重，若当前NC文件无该变量则给一个典型的默认值 1400.0 kg/m3
+            if 'BD_all' in dataset.variables:
+                bd_all = dataset.variables['BD_all'][valid_mask, :]
+            elif 'bden_soi' in dataset.variables:
+                bd_all = dataset.variables['bden_soi'][valid_mask, :]
+            else:
+                bd_all = np.full_like(wf_clay, 1400.0) 
+                
             dataset.close()
 
             t_soi = torch.tensor(t_soisno[:, 5:], dtype=torch.float32, device=device)
             wliq_soi = torch.tensor(wliq_soisno[:, 5:], dtype=torch.float32, device=device)
             clay_all = torch.tensor(wf_clay, dtype=torch.float32, device=device)
+            bd_all_tensor = torch.tensor(bd_all, dtype=torch.float32, device=device)
 
             dz_soi = rtm_model.dz_soi.unsqueeze(0).expand(t_soi.shape[0], -1)
             wc_all = wliq_soi / (dz_soi * 100.0)
@@ -79,6 +88,11 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             t_surf = ((t_soi[:, 0]*0.0175 + t_soi[:, 1]*0.0276) / wtot)
             wc_surf = (wliq_soi[:, 0] + wliq_soi[:, 1]) / (wtot * 1000.0)
             t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5)
+            
+            # 【新增】为 Wigneron 2008 准备物理参数
+            # 黏土需要转换为 fraction (0-1)，容重需要转换为 g/cm3
+            clay_surf = (clay_all[:, 0]*0.0175 + clay_all[:, 1]*0.0276) / wtot / 100.0
+            bd_surf = (bd_all_tensor[:, 0]*0.0175 + bd_all_tensor[:, 1]*0.0276) / wtot / 1000.0
 
             # Compute complex dielectric constant using stable M09
             eps = rtm_model.diel_soil_M09(wc_all, t_soi - rtm_model.tfrz, clay_all, f)
@@ -93,6 +107,11 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             teff_lv_multi = rtm_model.eff_soil_temp_Lv_multi(dz_soi, t_soi, eps, t_lam)
             teff_lv_two = rtm_model.eff_soil_temp_Lv_two(dz_soi, t_soi, eps, t_lam)
             teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
+            teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
+            # 【新增】调用新方案 (Holmes 需要表层第一层的介电常数)
+            eps_surf = eps[:, 0]
+            teff_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(eps_surf, t_surf, t_deep)
+            teff_wigneron2008 = rtm_model.eff_soil_temp_Wigneron2008(wc_surf, t_surf, t_deep, clay_surf, bd_surf)
 
             df_batch = pd.DataFrame({
                 'patch_lon': lon,
@@ -104,7 +123,9 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
                 'T_eff_wilheit_V': teff_wilheit_v.cpu().numpy(),
                 'T_eff_lv_multi': teff_lv_multi.cpu().numpy(),
                 'T_eff_lv_two': teff_lv_two.cpu().numpy(),
-                'T_eff_wigneron': teff_wigneron.cpu().numpy()
+                'T_eff_wigneron': teff_wigneron.cpu().numpy(),
+                'T_eff_holmes2006': teff_holmes2006.cpu().numpy(),       # 【新增】
+                'T_eff_wigneron2008': teff_wigneron2008.cpu().numpy()    # 【新增】
             })
             all_results.append(df_batch)
 
@@ -119,8 +140,8 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     print(f"Calculation finished successfully. Saved data table to: {csv_filename}\n")
 
     # Expanded to 4 rows and 2 columns subplot layout
-    fig, axs = plt.subplots(4, 2, figsize=(16, 22))
-    
+    # 扩展为 6行2列的布局 (为了容纳新增的4个对比图)
+    # fig, axs = plt.subplots(6, 2, figsize=(16, 32))
     plot_configs = [
         {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "row_idx": 0, "col_idx": 0, "is_temp": True, "is_unified": True},
         {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_V", "title": "Lv Multi-layer - Wilheit (V)", "row_idx": 0, "col_idx": 1, "is_temp": True, "is_unified": True},
@@ -128,8 +149,17 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_V", "title": "Lv Two-layer - Wilheit (V)", "row_idx": 1, "col_idx": 1, "is_temp": True, "is_unified": True},
         {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "row_idx": 2, "col_idx": 0, "is_temp": True, "is_unified": True},
         {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_V", "title": "Wigneron 2001 - Wilheit (V)", "row_idx": 2, "col_idx": 1, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "row_idx": 3, "col_idx": 0, "is_temp": True, "is_unified": False},
-        {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "row_idx": 3, "col_idx": 1, "is_temp": False, "is_unified": False}
+        
+        # 【新增】Wigneron 2008 方案对比
+        {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_H", "title": "Wigneron 2008 - Wilheit (H)", "row_idx": 3, "col_idx": 0, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_V", "title": "Wigneron 2008 - Wilheit (V)", "row_idx": 3, "col_idx": 1, "is_temp": True, "is_unified": True},
+        
+        # 【新增】Holmes 2006 方案对比
+        {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_H", "title": "Holmes 2006 - Wilheit (H)", "row_idx": 4, "col_idx": 0, "is_temp": True, "is_unified": True},
+        {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_V", "title": "Holmes 2006 - Wilheit (V)", "row_idx": 4, "col_idx": 1, "is_temp": True, "is_unified": True},
+        
+        {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "row_idx": 5, "col_idx": 0, "is_temp": True, "is_unified": False},
+        {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "row_idx": 5, "col_idx": 1, "is_temp": False, "is_unified": False}
     ]
 
     # Pre-calculate unified range for plots 1-6
@@ -170,44 +200,49 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             "Max Diff": round(max_diff, 4)
         })
         
-        # 绘图逻辑
-        ax = axs[cfg["row_idx"], cfg["col_idx"]]
-        vmin, vmax = (-global_max_abs, global_max_abs) if cfg["is_unified"] else (-max(abs(min_diff), abs(max_diff)) or -1e-4, max(abs(min_diff), abs(max_diff)) or 1e-4)
+        # # 绘图逻辑
+        # ax = axs[cfg["row_idx"], cfg["col_idx"]]
+        # vmin, vmax = (-global_max_abs, global_max_abs) if cfg["is_unified"] else (-max(abs(min_diff), abs(max_diff)) or -1e-4, max(abs(min_diff), abs(max_diff)) or 1e-4)
             
-        sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
-                        c=diff, cmap='coolwarm', s=1, vmin=-20, vmax=20)
+        # sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
+        #                 c=diff, cmap='coolwarm', s=1, vmin=-10, vmax=10)
         
-        ax.set_title(f"{cfg['title']}\n(RMSE: {rmse_val:.4f}{unit_str}, Bias: {mean_bias:.4f}{unit_str})")
-        ax.set_ylabel('Latitude')
-        ax.set_xlabel('Longitude')
-        cb_label = 'T_eff Difference (K)' if cfg["is_temp"] else 'Reflectivity Difference (-)'
-        plt.colorbar(sc, ax=ax, label=cb_label)
+        # ax.set_title(f"{cfg['title']}\n(RMSE: {rmse_val:.4f}{unit_str}, Bias: {mean_bias:.4f}{unit_str})")
+        # ax.set_ylabel('Latitude')
+        # ax.set_xlabel('Longitude')
+        # cb_label = 'T_eff Difference (K)' if cfg["is_temp"] else 'Reflectivity Difference (-)'
+        # plt.colorbar(sc, ax=ax, label=cb_label)
 
     # 转换为统计 DataFrame
     summary_df = pd.DataFrame(stats_list)
     
     # 终端打印展示
-    print("\n" + "="*80)
-    print(f" ERROR DISTRIBUTION SUMMARY TABLE ({time_format_str})")
-    print("="*80)
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 1000)
-    print(summary_df.to_string(index=False))
-    print("="*80 + "\n")
+    # print("\n" + "="*80)
+    # print(f" ERROR DISTRIBUTION SUMMARY TABLE ({time_format_str})")
+    # print("="*80)
+    # # pd.set_option('display.max_columns', None)
+    # # pd.set_option('display.width', 1000)
+    # print(summary_df.to_string(index=False))
+    # print("="*80 + "\n")
     
     # 修改处：将误差统计结果保存为标准的 CSV 文件而不再是 XLSX
     stats_csv_filename = f"Teff_stats_summary_{time_format_str}.csv"
     summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
     print(f"Statistics summary table successfully saved to CSV: {stats_csv_filename}")
 
-    plt.tight_layout()
-    plot_filename = f"Teff_diff_map_{time_format_str}.png"
-    plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
-    plt.close()
-    print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
+    # plt.tight_layout()
+    # plot_filename = f"Teff_diff_map_{time_format_str}.png"
+    # plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
+    # plt.close()
+    # print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
 
 if __name__ == "__main__":
     
-    for m in range(1, 13):
-        main(2016, m, 1, 0, 
-            output_dir='/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results')
+    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results'
+
+    for month in range(1, 13):
+        # 获取 2016 年该月的天数
+        _, days_in_month = calendar.monthrange(2016, month)
+        for day in range(1, days_in_month + 1):
+            for hour in range(24):
+                main(2016, month, day, hour, output_dir=output_dir)
