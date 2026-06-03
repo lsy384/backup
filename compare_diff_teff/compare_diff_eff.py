@@ -1,250 +1,280 @@
 import os
+import sys
 import glob
 import torch
 import datetime
 import numpy as np
-import pandas as pd
 import netCDF4 as nc
+import time
+import multiprocessing as mp
+import concurrent.futures
+from tqdm import tqdm
 
 # Import the RTM model containing the added Teff schemes
 from rtm import DifferentiableRTM
-import time  # <--- 修改处：引入时间模块
 
-def main():
-    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results'
-    os.makedirs(output_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    rtm_model = DifferentiableRTM().to(device)
-    rtm_model.eval()  # 设置为评估模式
-
-    # 物理与卫星常量设定
-    sat_fghz = 1.4 
-    sat_theta = 40.0 * np.pi / 180.0
-    f = sat_fghz * 1e9
-    lam = rtm_model.C / f
-    lamcm = lam * 100.0
-
-    nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
-    nc_files = sorted(glob.glob(os.path.join(nc_dir, 'forward_inputs_worker*.nc')))
+def worker_process(file_idx, file_path, total_files, output_dir):
+    """
+    单文件处理的独立 worker，自动分配 GPU 并重定向日志
+    """
+    # 获取进程 ID 用于绑定 GPU 和日志文件
+    current_process = mp.current_process()
+    worker_id = current_process._identity[0] if current_process._identity else 1
     
-    print(f"Found {len(nc_files)} NetCDF files. Initializing static data...")
-
-    # ==========================================
-    # STEP 1: 只在最开始读取并聚合所有的静态数据
-    # ==========================================
-    datasets = []
-    valid_masks = []
-    all_lon, all_lat, all_patchclass = [], [], []
-    all_wf_clay, all_bd_all = [], []
-
-    for file_path in nc_files:
-        try:
-            ds = nc.Dataset(file_path, 'r')
-            patchtype = ds.variables['patchtype'][:]
-            mask = patchtype < 3
-            
-            if not np.any(mask):
-                ds.close()
-                continue
-            
-            datasets.append(ds)
-            valid_masks.append(mask)
-            
-            all_lon.append(ds.variables['lon'][mask])
-            all_lat.append(ds.variables['lat'][mask])
-            all_patchclass.append(ds.variables['patchclass'][mask])
-            all_wf_clay.append(ds.variables['wf_clay'][mask, :])
-            
-            if 'BD_all' in ds.variables:
-                all_bd_all.append(ds.variables['BD_all'][mask, :])
-            elif 'bden_soi' in ds.variables:
-                all_bd_all.append(ds.variables['bden_soi'][mask, :])
-            else:
-                all_bd_all.append(np.full_like(ds.variables['wf_clay'][mask, :], 1400.0))
-        except Exception as e:
-            print(f"Error initializing {file_path}: {e}")
-
-    # 拼接全局静态 Numpy 数组
-    lon_np = np.concatenate(all_lon)
-    lat_np = np.concatenate(all_lat)
-    patchclass_np = np.concatenate(all_patchclass)
-    wf_clay_np = np.concatenate(all_wf_clay)
-    bd_all_np = np.concatenate(all_bd_all)
+    # 日志输出重定向
+    log_dir = "log_files_compare"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, f"worker_{worker_id}.log")
     
-    n_samples = len(lon_np)
-    print(f"Global valid patches loaded: {n_samples}.")
+    log_file = open(log_file_path, 'a', encoding='utf-8', buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = log_file
+    sys.stderr = log_file
 
-    # ==========================================
-    # STEP 2: 预计算表层整合参数，并常驻 GPU (节省每小时计算开销)
-    # ==========================================
-    wtot = 0.0175 + 0.0276
-    
-    # 预计算表层的粘土与容重 (合并层1和层2)
-    clay_surf_pct_np = (wf_clay_np[:, 0]*0.0175 + wf_clay_np[:, 1]*0.0276) / wtot
-    clay_surf_np = clay_surf_pct_np / 100.0 # Fraction format
-    bd_surf_np = (bd_all_np[:, 0]*0.0175 + bd_all_np[:, 1]*0.0276) / wtot / 1000.0
-
-    # 将不变的土壤属性推入 GPU
-    clay_all_gpu = torch.tensor(wf_clay_np, dtype=torch.float32, device=device)
-    clay_surf_pct_gpu = torch.tensor(clay_surf_pct_np, dtype=torch.float32, device=device)
-    clay_surf_gpu = torch.tensor(clay_surf_np, dtype=torch.float32, device=device)
-    bd_surf_gpu = torch.tensor(bd_surf_np, dtype=torch.float32, device=device)
-    
-    t_lam_gpu = torch.full((batch_size := 300000,), lam, dtype=torch.float32, device=device)
-    t_theta_gpu = torch.full((batch_size,), sat_theta, dtype=torch.float32, device=device)
-
-    # 确定时间轴
-    start_dt = datetime.datetime(2016, 1, 1, 0, 0)
-    total_time_steps = 8784  # 针对 2016 闰年
-
-    print("Starting hourly forward simulations...")
-
-    # ==========================================
-    # STEP 3: 时间循环 (避免重新打开文件，直接流式读取)
-    # ==========================================
-    t0 =time.time()
     try:
-        with torch.no_grad(): # 全局禁用计算图
-            for time_idx in range(total_time_steps):
-                current_dt = start_dt + datetime.timedelta(hours=time_idx)
-                time_format_str = current_dt.strftime("%Y-%m-%d-%H")
-                
-                # 提取当前时刻的动态数据 (只提取后10个土壤层 5:15)
-                all_t_soisno, all_wliq_soisno = [], []
-                for ds, mask in zip(datasets, valid_masks):
-                    # 为了规避不同 netcdf4 库的高级切片 Bug，先截取维度，再用 mask 过滤
-                    t_slice = ds.variables['t_soisno'][time_idx, :, 5:]
-                    wliq_slice = ds.variables['wliq_soisno'][time_idx, :, 5:]
-                    all_t_soisno.append(t_slice[mask])
-                    all_wliq_soisno.append(wliq_slice[mask])
-                    
-                t_soi_np = np.concatenate(all_t_soisno)
-                wliq_soi_np = np.concatenate(all_wliq_soisno)
-                
-                # 一次性将当前时间的动态数据推入 GPU
-                t_soi_full = torch.tensor(t_soi_np, dtype=torch.float32, device=device)
-                wliq_soi_full = torch.tensor(wliq_soi_np, dtype=torch.float32, device=device)
+        # 动态分配 GPU (利用身份 ID 对 4 取模)
+        # identity 通常从 1 开始，所以减 1 对 4 取模得到 0, 1, 2, 3
+        device_id = (worker_id - 1) % 4
+        device = torch.device(f"cuda:{device_id}")
+        
+        file_name = os.path.basename(file_path)
+        out_file_name = file_name.replace('forward_inputs_', 'Teff_outputs_')
+        out_file_path = os.path.join(output_dir, out_file_name)
+        
+        # ==========================================
+        # 1. 检查文件是否已存在 (断点续传)
+        # ==========================================
+        if os.path.exists(out_file_path):
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {out_file_name} already exists. Skipping...")
+            # 直接返回 True，并附带跳过信息
+            return True, file_path, f"Skipped: {out_file_name} exists"
 
-                # 用于收集当前时刻的结果
-                res_dict = {
-                    'r_H_wilheit': [], 'r_V_wilheit': [],
-                    'T_eff_wilheit_H': [], 'T_eff_wilheit_V': [],
-                    'T_eff_lv_multi': [], 'T_eff_lv_two': [],
-                    'T_eff_wigneron': [], 'T_eff_holmes2006': [], 'T_eff_wigneron2008': []
-                }
+        print(f"\n[{time.strftime('%H:%M:%S')}] [File {file_idx}/{total_files}] Loading {file_name} on GPU {device_id}...")
+        t_file_start = time.time()
+        
+        # 初始化模型
+        rtm_model = DifferentiableRTM().to(device)
+        rtm_model.eval()
 
-                # 在 GPU 上做 Batch 推理防爆显存
-                for i in range(0, n_samples, batch_size):
-                    end_idx = min(i + batch_size, n_samples)
+        # 物理与卫星常量设定 
+        sat_fghz = 1.4 
+        sat_theta = 40.0 * np.pi / 180.0
+        f = sat_fghz * 1e9
+        lam = rtm_model.C / f
+        lamcm = lam * 100.0
+        wtot = 0.0175 + 0.0276
+
+        res_keys = [
+            'r_H_wilheit', 'r_V_wilheit', 
+            'T_eff_wilheit_H', 'T_eff_wilheit_V',
+            'T_eff_lv_multi', 'T_eff_lv_two', 
+            'T_eff_wigneron', 'T_eff_holmes2006', 'T_eff_wigneron2008',
+            'depth_90_lv_multi'
+        ]
+
+        time_chunk_size = 8784  
+        batch_size = 1500000
+
+        # ==========================================
+        # 2. 读取文件与准备数据
+        # ==========================================
+        ds_in = nc.Dataset(file_path, 'r')
+        ds_in.set_auto_mask(False)  # 强行关闭自动 Mask 生成
+        
+        patchtype = ds_in.variables['patchtype'][:]
+        mask = patchtype < 3
+        if not np.any(mask):
+            ds_in.close()
+            return True, file_path, f"No valid patches in {file_name}"
+            
+        valid_idx = np.where(mask)[0]
+        n_patches = len(valid_idx)
+        total_time = ds_in.variables['time'].shape[0]
+        
+        lon_np = ds_in.variables['lon'][valid_idx]
+        lat_np = ds_in.variables['lat'][valid_idx]
+        patchclass_np = ds_in.variables['patchclass'][valid_idx]
+        wf_clay_np = ds_in.variables['wf_clay'][valid_idx, :]
+        
+        if 'BD_all' in ds_in.variables:
+            bd_all_np = ds_in.variables['BD_all'][valid_idx, :]
+        elif 'bden_soi' in ds_in.variables:
+            bd_all_np = ds_in.variables['bden_soi'][valid_idx, :]
+        else:
+            bd_all_np = np.full_like(wf_clay_np, 1400.0)
+        
+        clay_surf_pct_np = (wf_clay_np[:, 0]*0.0175 + wf_clay_np[:, 1]*0.0276) / wtot
+        clay_surf_np = clay_surf_pct_np / 100.0 
+        bd_surf_np = (bd_all_np[:, 0]*0.0175 + bd_all_np[:, 1]*0.0276) / wtot / 1000.0
+
+        base_clay_all = torch.tensor(wf_clay_np, dtype=torch.float32, device=device)
+        base_clay_surf_pct = torch.tensor(clay_surf_pct_np, dtype=torch.float32, device=device)
+        base_clay_surf = torch.tensor(clay_surf_np, dtype=torch.float32, device=device)
+        base_bd_surf = torch.tensor(bd_surf_np, dtype=torch.float32, device=device)
+
+        ds_out = nc.Dataset(out_file_path, 'w')
+        ds_out.createDimension('time', total_time)
+        ds_out.createDimension('patch', n_patches)
+        
+        v_time = ds_out.createVariable('time', 'f8', ('time',))
+        v_lon = ds_out.createVariable('lon', 'f8', ('patch',))
+        v_lat = ds_out.createVariable('lat', 'f8', ('patch',))
+        v_pclass = ds_out.createVariable('patchclass', 'i4', ('patch',))
+        
+        v_time[:] = ds_in.variables['time'][:]
+        v_lon[:] = lon_np
+        v_lat[:] = lat_np
+        v_pclass[:] = patchclass_np
+        
+        out_vars = {}
+        for key in res_keys:
+            out_vars[key] = ds_out.createVariable(key, 'f4', ('time', 'patch'), zlib=True)
+
+        # ==========================================
+        # 3. GPU 推理核心循环
+        # ==========================================
+        with torch.no_grad():
+            for t_start in range(0, total_time, time_chunk_size):
+                t_end = min(t_start + time_chunk_size, total_time)
+                cur_T = t_end - t_start
+                
+                # 连续内存拉出，高速索引
+                t_soisno_raw = ds_in.variables['t_soisno'][:]
+                wliq_soisno_raw = ds_in.variables['wliq_soisno'][:]
+                
+                t_soisno_chunk = t_soisno_raw[t_start:t_end, valid_idx, 5:]
+                wliq_soisno_chunk = wliq_soisno_raw[t_start:t_end, valid_idx, 5:]
+                
+                del t_soisno_raw
+                del wliq_soisno_raw
+                
+                t_soi_full = torch.tensor(t_soisno_chunk, dtype=torch.float32, device=device).reshape(-1, 10)
+                wliq_soi_full = torch.tensor(wliq_soisno_chunk, dtype=torch.float32, device=device).reshape(-1, 10)
+                total_samples = cur_T * n_patches
+                
+                clay_all_chunk = base_clay_all.unsqueeze(0).expand(cur_T, n_patches, 10).reshape(-1, 10)
+                clay_surf_pct_chunk = base_clay_surf_pct.unsqueeze(0).expand(cur_T, n_patches).reshape(-1)
+                clay_surf_chunk = base_clay_surf.unsqueeze(0).expand(cur_T, n_patches).reshape(-1)
+                bd_surf_chunk = base_bd_surf.unsqueeze(0).expand(cur_T, n_patches).reshape(-1)
+                
+                chunk_res = {k: [] for k in res_keys}
+
+                for i in range(0, total_samples, batch_size):
+                    end_idx = min(i + batch_size, total_samples)
                     cur_b = end_idx - i
                     
                     t_soi = t_soi_full[i:end_idx]
                     wliq_soi = wliq_soi_full[i:end_idx]
-                    clay_all = clay_all_gpu[i:end_idx]
-                    clay_surf_pct = clay_surf_pct_gpu[i:end_idx]
-                    clay_surf = clay_surf_gpu[i:end_idx]
-                    bd_surf = bd_surf_gpu[i:end_idx]
+                    clay_all = clay_all_chunk[i:end_idx]
+                    clay_surf_pct = clay_surf_pct_chunk[i:end_idx]
+                    clay_surf = clay_surf_chunk[i:end_idx]
+                    bd_surf = bd_surf_chunk[i:end_idx]
                     
-                    t_lam = t_lam_gpu[:cur_b]
-                    t_theta = t_theta_gpu[:cur_b]
+                    t_lam = torch.full((cur_b,), lam, dtype=torch.float32, device=device)
+                    t_theta = torch.full((cur_b,), sat_theta, dtype=torch.float32, device=device)
 
                     dz_soi = rtm_model.dz_soi.unsqueeze(0).expand(cur_b, -1)
                     wc_all = wliq_soi / (dz_soi * 100.0)
                     
-                    # 动态求解温度与水分的表层及深层整体参数
                     t_surf = ((t_soi[:, 0]*0.0175 + t_soi[:, 1]*0.0276) / wtot)
                     wc_surf = (wliq_soi[:, 0] + wliq_soi[:, 1]) / (wtot * 1000.0)
                     t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5)
 
-                    # 统一计算各层复介电常数及表层整体复介电常数
                     eps = rtm_model.diel_soil_M09(wc_all, t_soi - rtm_model.tfrz, clay_all, f)
                     eps_surf = rtm_model.diel_soil_M09(wc_surf, t_surf - rtm_model.tfrz, clay_surf_pct, f)
 
-                    # ====== 执行各种 Teff 方案 ======
                     r_h, r_v, teff_wilheit_h, teff_wilheit_v = rtm_model.eff_soil_temp_Wilheit(dz_soi, t_soi, eps, t_theta, lamcm)
-                    teff_lv_multi = rtm_model.eff_soil_temp_Lv_multi(dz_soi, t_soi, eps, t_lam)
+                    teff_lv_multi, weights_lv = rtm_model.eff_soil_temp_Lv_multi(dz_soi, t_soi, eps, t_lam, return_weights=True)
                     
-                    # Lv Two-layer (传入整合后的表层参数)
+                    cum_dz = torch.cumsum(dz_soi, dim=1)                 
+                    cum_weights = torch.cumsum(weights_lv, dim=1)        
+                    
+                    idx_90 = torch.argmax((cum_weights >= 0.9).int(), dim=1, keepdim=True)
+                    cw_i = torch.gather(cum_weights, 1, idx_90).squeeze(1)
+                    dz_i = torch.gather(dz_soi, 1, idx_90).squeeze(1)
+                    
+                    pad_cw = torch.cat([torch.zeros_like(cum_weights[:, :1]), cum_weights], dim=1)
+                    pad_cdz = torch.cat([torch.zeros_like(cum_dz[:, :1]), cum_dz], dim=1)
+                    
+                    cw_prev = torch.gather(pad_cw, 1, idx_90).squeeze(1)
+                    cdz_prev = torch.gather(pad_cdz, 1, idx_90).squeeze(1)
+                    
+                    weight_diff = torch.clamp(cw_i - cw_prev, min=1e-8) 
+                    depth_90 = cdz_prev + (0.9 - cw_prev) / weight_diff * dz_i
+
                     teff_lv_two = rtm_model.eff_soil_temp_Lv_two(wtot, t_surf, t_deep, eps_surf, t_lam)
-                    
                     teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
-                    
-                    # Holmes & Wigneron 2008 
                     teff_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(eps_surf, t_surf, t_deep)
                     teff_wigneron2008 = rtm_model.eff_soil_temp_Wigneron2008(wc_surf, t_surf, t_deep, clay_surf, bd_surf)
 
-                    # 将计算结果退回 CPU 并记录
-                    res_dict['r_H_wilheit'].append(r_h.cpu().numpy())
-                    res_dict['r_V_wilheit'].append(r_v.cpu().numpy())
-                    res_dict['T_eff_wilheit_H'].append(teff_wilheit_h.cpu().numpy())
-                    res_dict['T_eff_wilheit_V'].append(teff_wilheit_v.cpu().numpy())
-                    res_dict['T_eff_lv_multi'].append(teff_lv_multi.cpu().numpy())
-                    res_dict['T_eff_lv_two'].append(teff_lv_two.cpu().numpy())
-                    res_dict['T_eff_wigneron'].append(teff_wigneron.cpu().numpy())
-                    res_dict['T_eff_holmes2006'].append(teff_holmes2006.cpu().numpy())
-                    res_dict['T_eff_wigneron2008'].append(teff_wigneron2008.cpu().numpy())
+                    chunk_res['r_H_wilheit'].append(r_h.cpu().numpy())
+                    chunk_res['r_V_wilheit'].append(r_v.cpu().numpy())
+                    chunk_res['T_eff_wilheit_H'].append(teff_wilheit_h.cpu().numpy())
+                    chunk_res['T_eff_wilheit_V'].append(teff_wilheit_v.cpu().numpy())
+                    chunk_res['T_eff_lv_multi'].append(teff_lv_multi.cpu().numpy())
+                    chunk_res['T_eff_lv_two'].append(teff_lv_two.cpu().numpy())
+                    chunk_res['T_eff_wigneron'].append(teff_wigneron.cpu().numpy())
+                    chunk_res['T_eff_holmes2006'].append(teff_holmes2006.cpu().numpy())
+                    chunk_res['T_eff_wigneron2008'].append(teff_wigneron2008.cpu().numpy())
+                    chunk_res['depth_90_lv_multi'].append(depth_90.cpu().numpy()) 
 
-                # === 生成当小时的 DataFrame 并求误差统计 ===
-                df_data = {
-                    'patch_lon': lon_np,
-                    'patch_lat': lat_np,
-                    'patchclass': patchclass_np
-                }
-                for key in res_dict:
-                    df_data[key] = np.concatenate(res_dict[key])
-                final_df = pd.DataFrame(df_data)
-                
-                # 保存空间像素 CSV
-                csv_filename = f"Teff_compare_{time_format_str}.csv"
-                final_df.to_csv(os.path.join(output_dir, csv_filename), index=False)
-
-                # === 误差统计清单 ===
-                plot_configs = [
-                    {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "is_temp": True},
-                    {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_V", "title": "Lv Multi-layer - Wilheit (V)", "is_temp": True},
-                    {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_H", "title": "Lv Two-layer - Wilheit (H)", "is_temp": True},
-                    {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_V", "title": "Lv Two-layer - Wilheit (V)", "is_temp": True},
-                    {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "is_temp": True},
-                    {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_V", "title": "Wigneron 2001 - Wilheit (V)", "is_temp": True},
-                    {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_H", "title": "Wigneron 2008 - Wilheit (H)", "is_temp": True},
-                    {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_V", "title": "Wigneron 2008 - Wilheit (V)", "is_temp": True},
-                    {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_H", "title": "Holmes 2006 - Wilheit (H)", "is_temp": True},
-                    {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_V", "title": "Holmes 2006 - Wilheit (V)", "is_temp": True},
-                    {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "is_temp": True},
-                    {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "is_temp": False}
-                ]
-
-                stats_list = []
-                for cfg in plot_configs:
-                    diff = final_df[cfg["col"]] - final_df[cfg["ref"]]
-                    unit_str = "K" if cfg["is_temp"] else "-"
-                    stats_list.append({
-                        "Scheme Profile": cfg["title"],
-                        "Total Patches": len(diff),
-                        "Unit": unit_str,
-                        "MBE": round(float(diff.mean()), 4),
-                        "SD": round(float(diff.std()), 4),
-                        "RMSE": round(float(np.sqrt((diff ** 2).mean())), 4),
-                        "Min Diff": round(float(diff.min()), 4),
-                        "Max Diff": round(float(diff.max()), 4)
-                    })
-                
-                # 保存统计摘要 CSV
-                summary_df = pd.DataFrame(stats_list)
-                stats_csv_filename = f"Teff_stats_summary_{time_format_str}.csv"
-                summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
-                
-                print(f"[{time_format_str}] Processed & Saved (Time index: {time_idx}) | spend {time.time() - t0:.2f} seconds")
-
+                for key in res_keys:
+                    concat_res = np.concatenate(chunk_res[key])
+                    out_vars[key][t_start:t_end, :] = concat_res.reshape(cur_T, n_patches)
+        
+        ds_in.close()
+        ds_out.close()
+        print(f"✅ [GPU {device_id} | {time.strftime('%H:%M:%S')}] Finished {out_file_name} | Cost: {time.time() - t_file_start:.2f} s")
+        return True, file_path, f"Processed {file_name} -> GPU {device_id}"
+        
+    except Exception as e:
+        print(f"❌ [GPU {device_id}] Error processing {file_path}: {e}")
+        return False, file_path, f"Error in {os.path.basename(file_path)}: {e}"
+        
     finally:
-        # 安全地关闭所有 NetCDF 文件句柄
-        for ds in datasets:
-            ds.close()
-        print("All NetCDF datasets closed successfully. Mission complete.")
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 if __name__ == "__main__":
-    main()
+    # 强制在子进程中重新分配 CUDA 内存池以防止死锁
+    mp.set_start_method('spawn', force=True)
+
+    nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
+    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results'
+    os.makedirs(output_dir, exist_ok=True)
+
+    nc_files = sorted(glob.glob(os.path.join(nc_dir, 'forward_inputs_worker*.nc')))
+    total_files = len(nc_files)
+    
+    MAX_WORKERS = 4  # 4进程对应 4张 5090
+    
+    print(f"\n=======================================================")
+    print(f"🚀 开始多卡高并发提取，共发现 {total_files} 个 NetCDF 文件")
+    print(f"分配策略: {MAX_WORKERS} 个并发 Worker 均匀分布在 4 张 5090 显卡上")
+    print(f"日志状态: 进程内计算细节将被静默记录到 `log_files_compare` 目录")
+    print(f"=======================================================\n")
+
+    t_global_start = time.time()
+
+    # 启用 ProcessPoolExecutor 强力调度
+    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 将任务提交入池
+        futures = {
+            executor.submit(worker_process, idx, file_path, total_files, output_dir): file_path 
+            for idx, file_path in enumerate(nc_files, 1)
+        }
+        
+        # tqdm 在主线程接管进度，展示极其整洁的 UI
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="🚀 全局计算进度"):
+            success, file_path, msg = future.result()
+            
+            # 只有遇到错误时，才打破进度条在主终端报错提醒你
+            if not success:
+                tqdm.write(f"❌ 警告: {msg}")
+
+    print(f"\n🎉 All files processed successfully! Total Elapsed Time: {(time.time() - t_global_start) / 60:.2f} mins.")
 
 
 
