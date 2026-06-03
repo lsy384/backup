@@ -486,7 +486,45 @@ class DifferentiableRTM(nn.Module):
         teff = t_deep + (t_surf - t_deep) * C
         return teff
     
+    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep):
+        """
+        Holmes 2006 model (基于介电常数比值的参数化)
+        eps_surf: 表层复介电常数 (complex)
+        """
+        eps_r = eps_surf.real
+        eps_i = torch.abs(eps_surf.imag)
+        
+        # 2003-2004 interannual calibration parameters
+        eps0_param = 0.08
+        b_param = 0.87
+        
+        # C(eps) = ((eps'' / eps') / eps0_param)^b
+        eps_ratio = eps_i / eps_r
+        C = (eps_ratio / eps0_param) ** b_param
+        # 限制 C 的范围在 [0, 1] 之间，防止极端干燥条件下的非物理外推
+        C = torch.clamp(C, min=0.0, max=1.0)
+        
+        teff = t_deep + (t_surf - t_deep) * C
+        return teff
 
+    def eff_soil_temp_Wigneron2008(self, wc_surf, t_surf, t_deep, clay_frac, bulk_density):
+        """
+        Wigneron 2008 '4P' model for T_surf at 2cm (引入质地和容重)
+        wc_surf: 表层体积含水量 (m3/m3)
+        clay_frac: 表层黏粒比例 (fraction, 0~1)
+        bulk_density: 表层土壤容重 (g/cm3)
+        """
+        w0 = 0.5996
+        # b = b1 + b3*C + b4*rho_b
+        b = 0.3955 - 0.2803 * clay_frac - 0.10849 * bulk_density
+        
+        C_param = torch.clamp((wc_surf / w0)**b, min=0.001, max=1.0)
+        C_param = torch.where(wc_surf < 0.0, torch.full_like(C_param, 0.001), C_param)
+        
+        teff = t_deep + (t_surf - t_deep) * C_param
+        return teff
+    
+    
     def eff_soil_temp_Lv(self, dz_soi, t_soi, wc_soi, f, lam, wf_clay,
                          znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,
                          ):
