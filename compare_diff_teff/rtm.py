@@ -494,7 +494,7 @@ class DifferentiableRTM(nn.Module):
         teff = t_deep + (t_surf - t_deep) * C
         return teff
     
-    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep, return_C=False):
+    def eff_soil_temp_Holmes2006(self, wc_surf, eps_surf, t_surf, t_deep, return_C=False):
         """
         Holmes 2006 model (基于介电常数比值的参数化)
         eps_surf: 表层复介电常数 (complex)
@@ -503,13 +503,16 @@ class DifferentiableRTM(nn.Module):
         eps_i = torch.abs(eps_surf.imag)
         
         # 2003-2004 interannual calibration parameters
-        eps0_param = 0.08
         b_param = 0.05      # 0.87
-        
+        eps0_param = 0.08
+        # --- 修改部分开始 ---
+        # 使用 torch.where 根据 wc_surf 的值逐元素初始化 eps0_param  #没有好多少在极低湿度下
+        # b_param = torch.where(wc_surf < 0.005, 0.1, 0.05).to(wc_surf.device)
+
         # C(eps) = ((eps'' / eps') / eps0_param)^b
         eps_ratio = eps_i / eps_r
         C = (eps_ratio / eps0_param) ** b_param
-        # 限制 C 的范围在 [0, 1] 之间，防止极端干燥条件下的非物理外推
+        # 注：原注释说限制在 [0, 1]，torch.clamp 只限制了 min，建议视需求决定是否加上 max=1.0
         C = torch.clamp(C, min=0.001)
         
         teff = t_deep + (t_surf - t_deep) * C
