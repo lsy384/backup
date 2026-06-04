@@ -126,7 +126,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     out_dict = {
         'T_eff_wilheit_H': [], 'T_eff_wilheit_V': [], 'T_eff_lv_multi': [], 'T_eff_lv_two': [],
         'T_eff_wigneron': [], 'T_eff_holmes2006': [], 'T_eff_wigneron2008': [], 'depth_90_lv_multi': [],
-        't_surf': [], 'wc_surf': [], 'clay_surf': [], 'sand_surf': [], 'bd_surf': [], 't_deep': [],
+        't_surf': [], 'wc_surf': [], 'clay_surf': [], 'mvt_surf': [], 'sand_surf': [], 'bd_surf': [], 't_deep': [],
         'eps_surf_real': [], 'eps_surf_imag': [],
         'C_lv_two': [], 'C_holmes2006': [], 'C_inverted_wilheit': [], 'dz_surf_inverted': []
     }
@@ -151,6 +151,10 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         clay_surf_pct = (clay_all[:, 0]*0.0175 + clay_all[:, 1]*0.0276) / wtot 
         sand_surf_pct = (sand_all[:, 0]*0.0175 + sand_all[:, 1]*0.0276) / wtot  
         clay_surf = clay_surf_pct / 100.0 
+        
+        # 计算 M09 方案的最大结合水含量 (mvt)
+        mvt_surf = 0.02863 + 0.30673e-2 * clay_surf_pct
+        
         bd_surf = (bd_all_tensor[:, 0]*0.0175 + bd_all_tensor[:, 1]*0.0276) / wtot / 1000.0
         
         eps = rtm_model.diel_soil_M09(wc_all, t_soi - rtm_model.tfrz, clay_all, f)
@@ -214,6 +218,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         out_dict['t_surf'].append(t_surf.cpu().numpy())
         out_dict['wc_surf'].append(wc_surf.cpu().numpy())
         out_dict['clay_surf'].append(clay_surf_pct.cpu().numpy())  
+        out_dict['mvt_surf'].append(mvt_surf.cpu().numpy())  
         out_dict['sand_surf'].append(sand_surf_pct.cpu().numpy())  
         out_dict['bd_surf'].append((bd_surf * 1000.0).cpu().numpy()) 
         out_dict['t_deep'].append(t_deep.cpu().numpy())
@@ -245,21 +250,28 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     print(f"Calculation finished successfully. Saved data table to: {csv_filename}")
 
     # ==================================================
-    # 【新增逻辑】筛选出 Diff 绝对值大于设定阈值的异常大误差样本
+    # 【计算差异】用于样本条件筛选
     # ==================================================
-    diff_threshold = 5.0  # 设定差异阈值 (单位: K)
-    
-    # 计算两个指定 Scheme 相较于 Wilheit(H) 的绝对误差
     diff_lv_multi_abs = np.abs(final_df['T_eff_lv_multi'] - final_df['T_eff_wilheit_H'])
     diff_holmes_abs = np.abs(final_df['T_eff_holmes2006'] - final_df['T_eff_wilheit_H'])
-    
-    # 只要任意一个模型的绝对差异大于阈值，即判定为大误差样本
-    large_loss_mask =  (diff_holmes_abs > diff_threshold)  #(diff_lv_multi_abs > diff_threshold) &
+
+    # 1. 筛选出大误差样本 (Holmes 绝对差异大于 5K)
+    large_loss_threshold = 5.0  
+    large_loss_mask = (diff_holmes_abs > large_loss_threshold)
     large_loss_df = final_df[large_loss_mask]
     
     large_loss_csv_filename = f"Teff_compare_large_loss_{time_format_str}.csv"
     large_loss_df.to_csv(os.path.join(output_dir, large_loss_csv_filename), index=False)
-    print(f"Filtered large loss samples (Diff > {diff_threshold}K). Total patches: {len(large_loss_df)}. Saved to: {large_loss_csv_filename}\n")
+    print(f"Filtered large loss samples (Diff > {large_loss_threshold}K). Total patches: {len(large_loss_df)}. Saved to: {large_loss_csv_filename}")
+
+    # 2. 新增逻辑：筛选出小误差样本 (任意一个模型的绝对差异小于 1K)
+    little_loss_threshold = 1.0  
+    little_loss_mask = (diff_holmes_abs <= little_loss_threshold) #& (diff_lv_multi_abs < little_loss_threshold)
+    little_loss_df = final_df[little_loss_mask]
+    
+    little_loss_csv_filename = f"Teff_compare_little_loss_{time_format_str}.csv"
+    little_loss_df.to_csv(os.path.join(output_dir, little_loss_csv_filename), index=False)
+    print(f"Filtered little loss samples (Diff < {little_loss_threshold}K). Total patches: {len(little_loss_df)}. Saved to: {little_loss_csv_filename}\n")
 
     # ==================================================
     # GRID PLOT LAYOUT (保持5行2列原有空间差异图不变)
@@ -392,17 +404,17 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
     print(f"Multi-condition statistics summary table successfully saved to CSV: {stats_csv_filename}")
 
-    plt.tight_layout()
-    plot_filename = f"Teff_diff_map_{time_format_str}.png"
-    plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
-    plt.close()
-    print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
+    # plt.tight_layout()
+    # plot_filename = f"Teff_diff_map_{time_format_str}.png"
+    # plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
+    # plt.close()
+    # print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
 
 if __name__ == "__main__":
-    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try'
+    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_1'
     t0 = time.time()
     for month in range(1, 13):
         main(2016, month, 1, 0, output_dir=output_dir)
         print(f"Month {month} completed in {time.time()-t0:.2f} seconds")
         
-        break
+        # break
