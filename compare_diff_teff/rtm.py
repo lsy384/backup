@@ -446,7 +446,7 @@ class DifferentiableRTM(nn.Module):
         return r_h, r_v, teff_h, teff_v
     
 
-    def eff_soil_temp_Lv_multi(self, dz_soi, t_soi, eps, lam):
+    def eff_soil_temp_Lv_multi(self, dz_soi, t_soi, eps, lam, return_weights=False):
         # Calculate effective temperature using Lv multi-layer discrete scheme
         eps_r = eps.real
         eps_i = torch.abs(eps.imag)
@@ -461,20 +461,28 @@ class DifferentiableRTM(nn.Module):
         weights = (1.0 - exp_B) * prod_term
         weights[:, -1] = prod_term[:, -1]
         
-        return torch.sum(t_soi * weights, dim=1)
+        teff = torch.sum(t_soi * weights, dim=1)
+        
+        # 新增：允许返回权重
+        if return_weights:
+            return teff, weights
+        return teff
+    
 
-    def eff_soil_temp_Lv_two(self, dz_soi, t_soi, eps, lam):
+    def eff_soil_temp_Lv_two(self, dz_surf, t_surf, t_deep, eps_surf, lam, return_C=False):
         # Calculate effective temperature using Lv two-layer scheme
-        eps_r = eps[:, 0].real
-        eps_i = torch.abs(eps[:, 0].imag)
+        eps_r = eps_surf.real
+        eps_i = torch.abs(eps_surf.imag)
         lam_val = lam.unsqueeze(1) if lam.dim() == 1 else lam
         
-        B1 = dz_soi[:, 0] * (4.0 * self.pi / lam_val.squeeze(-1)) * (eps_i / (2.0 * torch.sqrt(eps_r)))
+        # 此时 dz_surf 传入的是一个标量 (wtot)
+        B1 = dz_surf * (4.0 * self.pi / lam_val.squeeze(-1)) * (eps_i / (2.0 * torch.sqrt(eps_r)))
         
-        t1 = t_soi[:, 0]
-        t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5)
-        
-        teff = t1 * (1.0 - torch.exp(-B1)) + t_deep * torch.exp(-B1)
+        # 统一使用外部算好的表层和深层温度
+        teff = t_surf * (1.0 - torch.exp(-B1)) + t_deep * torch.exp(-B1)
+        C = 1.0 - torch.exp(-B1)
+        if return_C:
+            return teff, C
         return teff
 
     def eff_soil_temp_Wigneron2001(self, wc_surf, t_surf, t_deep):
@@ -486,7 +494,7 @@ class DifferentiableRTM(nn.Module):
         teff = t_deep + (t_surf - t_deep) * C
         return teff
     
-    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep):
+    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep, return_C=False):
         """
         Holmes 2006 model (基于介电常数比值的参数化)
         eps_surf: 表层复介电常数 (complex)
@@ -496,15 +504,17 @@ class DifferentiableRTM(nn.Module):
         
         # 2003-2004 interannual calibration parameters
         eps0_param = 0.08
-        b_param = 0.87
+        b_param = 0.05      # 0.87
         
         # C(eps) = ((eps'' / eps') / eps0_param)^b
         eps_ratio = eps_i / eps_r
         C = (eps_ratio / eps0_param) ** b_param
         # 限制 C 的范围在 [0, 1] 之间，防止极端干燥条件下的非物理外推
-        C = torch.clamp(C, min=0.0, max=1.0)
+        C = torch.clamp(C, min=0.001)
         
         teff = t_deep + (t_surf - t_deep) * C
+        if return_C:
+            return teff, C
         return teff
 
     def eff_soil_temp_Wigneron2008(self, wc_surf, t_surf, t_deep, clay_frac, bulk_density):
