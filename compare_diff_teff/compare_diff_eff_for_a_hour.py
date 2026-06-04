@@ -156,7 +156,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         wtot = 0.0175
         t_surf = t_soi[:, 0]
         wc_surf = wliq_soi[:, 0] / (wtot * 1000.0)   
-        t_deep =  t_soi[:, -1]
+        t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5) # 改成t_soi[:, -1]没啥变化
         bd_surf = bd_all_tensor[:, 0] / 1000.0    
         
         # 计算10层土壤的最大温度 (沿维度1求最大值)
@@ -202,7 +202,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             teff_lv_two, C_lv_two = rtm_model.eff_soil_temp_Lv_two(wtot, t_surf, t_deep, eps_surf, t_lam, return_C=True)
             teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
             
-            teff_holmes2006, C_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(eps_surf, t_surf, t_deep, return_C=True)
+            teff_holmes2006, C_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(wc_surf, eps_surf, t_surf, t_deep, return_C=True)
             teff_wigneron2008 = rtm_model.eff_soil_temp_Wigneron2008(wc_surf, t_surf, t_deep, clay_surf, bd_surf)
 
             # 基于 T_eff_wilheit_H 反推 C 值与修正后的 dz_surf (Δx)
@@ -450,6 +450,6 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
 if __name__ == "__main__":
     output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_2'
     t0 = time.time()
-    for month in range(1, 13):
+    for month in range(6, 9):
         main(2016, month, 1, 0, output_dir=output_dir)
         print(f"Month {month} completed in {time.time()-t0:.2f} seconds")
