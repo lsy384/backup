@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import calendar
 # Import the RTM model containing the added Teff schemes
 from rtm import DifferentiableRTM
+import time
 
 def main(target_year, target_month, target_day, target_hour, output_dir):
     # ==========================================
@@ -267,9 +268,10 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
 if __name__ == "__main__":
     
     output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_1'
-
+    t0=time.time()
     for month in range(1, 13):
         main(2016, month, 1, 0, output_dir=output_dir)
+        print(f"Month {month} completed in {time.time()-t0:.2f} seconds")
         # # 获取 2016 年该月的天数
         # _, days_in_month = calendar.monthrange(2016, month)
         # for day in range(1, days_in_month + 1):
