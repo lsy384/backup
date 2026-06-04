@@ -122,13 +122,13 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     t_compute_start = time.time()
     batch_size = 250000  
     
-    # 初始化按严格指定的列顺序存储的字典容器
+    # 初始化按严格指定的列顺序存储的字典容器 (新增 b_param_inverted 位于 C_inverted_wilheit 与 dz_surf_inverted 之间)
     out_dict = {
         'T_eff_wilheit_H': [], 'T_eff_wilheit_V': [], 'T_eff_lv_multi': [], 'T_eff_lv_two': [],
         'T_eff_wigneron': [], 'T_eff_holmes2006': [], 'T_eff_wigneron2008': [], 'depth_90_lv_multi': [],
         't_surf': [], 'wc_surf': [], 'clay_surf': [], 'mvt_surf': [], 'sand_surf': [], 'bd_surf': [], 't_deep': [],
         'eps_surf_real': [], 'eps_surf_imag': [],
-        'C_lv_two': [], 'C_holmes2006': [], 'C_inverted_wilheit': [], 'dz_surf_inverted': []
+        'C_lv_two': [], 'C_holmes2006': [], 'C_inverted_wilheit': [], 'b_param_inverted': [], 'dz_surf_inverted': []
     }
 
     for i in range(0, num_patches, batch_size):
@@ -200,6 +200,17 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             
             eps_surf_r = eps_surf.real
             eps_surf_i = torch.abs(eps_surf.imag)
+            
+            # --- 新增逻辑: 依据 Holmes 公式 C = (eps_ratio / eps0_param)**b_param 反推 b_param ---
+            eps0_param = 0.08
+            eps_ratio = eps_surf_i / eps_surf_r
+            eps_ratio_norm = torch.clamp(eps_ratio / eps0_param, min=1e-5)
+            log_denom = torch.log(eps_ratio_norm)
+            # 防止对数项为 0 导致被除数为零出现 nan/inf
+            log_denom_safe = torch.where(log_denom.abs() < 1e-8, torch.tensor(1e-8, device=device), log_denom)
+            b_param_inverted = torch.log(C_inverted_clamped) / log_denom_safe
+            # --------------------------------------------------------------------------------
+            
             factor = (4.0 * np.pi / t_lam) * (eps_surf_i / (2.0 * torch.sqrt(eps_surf_r)))
             factor_safe = torch.where(factor < 1e-8, torch.tensor(1e-8, device=device), factor)
             
@@ -228,6 +239,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         out_dict['C_lv_two'].append(C_lv_two.cpu().numpy())
         out_dict['C_holmes2006'].append(C_holmes2006.cpu().numpy())
         out_dict['C_inverted_wilheit'].append(C_inverted.cpu().numpy())
+        out_dict['b_param_inverted'].append(b_param_inverted.cpu().numpy())
         out_dict['dz_surf_inverted'].append(dz_surf_inverted.cpu().numpy())
 
     print(f"GPU Computing completed in {time.time() - t_compute_start:.2f} seconds.")
