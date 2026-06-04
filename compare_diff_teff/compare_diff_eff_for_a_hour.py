@@ -122,14 +122,20 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     t_compute_start = time.time()
     batch_size = 250000  
     
-    # 初始化按严格指定的列顺序存储的字典容器 (新增 b_param_inverted 位于 C_inverted_wilheit 与 dz_surf_inverted 之间)
+    # 初始化按严格指定的列顺序存储的字典容器 (新增 t_soi_max 位于 t_deep 与 eps_surf_real 之间)
     out_dict = {
         'T_eff_wilheit_H': [], 'T_eff_wilheit_V': [], 'T_eff_lv_multi': [], 'T_eff_lv_two': [],
         'T_eff_wigneron': [], 'T_eff_holmes2006': [], 'T_eff_wigneron2008': [], 'depth_90_lv_multi': [],
-        't_surf': [], 'wc_surf': [], 'clay_surf': [], 'mvt_surf': [], 'sand_surf': [], 'bd_surf': [], 't_deep': [],
+        't_surf': [], 'wc_surf': [], 'clay_surf': [], 'mvt_surf': [], 'sand_surf': [], 'bd_surf': [], 
+        't_deep': [], 
+        't_soi_max': [], 't_soi_min': [], # <--- 新增：10层土壤最大温度位置
         'eps_surf_real': [], 'eps_surf_imag': [],
         'C_lv_two': [], 'C_holmes2006': [], 'C_inverted_wilheit': [], 'b_param_inverted': [], 'dz_surf_inverted': []
     }
+    
+    # 动态加入 10层土壤温度键，会自动排在 dz_surf_inverted 之后
+    for layer in range(1, 11):
+        out_dict[f't_soi_layer_{layer}'] = []
 
     for i in range(0, num_patches, batch_size):
         end_idx = min(i + batch_size, num_patches)
@@ -143,19 +149,29 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         dz_soi = rtm_model.dz_soi.unsqueeze(0).expand(t_soi.shape[0], -1)
         wc_all = wliq_soi / (dz_soi * 100.0)
         
-        wtot = 0.0175 + 0.0276
-        t_surf = ((t_soi[:, 0]*0.0175 + t_soi[:, 1]*0.0276) / wtot)
-        wc_surf = (wliq_soi[:, 0] + wliq_soi[:, 1]) / (wtot * 1000.0)
-        t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5)
+        # wtot = 0.0175 + 0.0276
+        # t_surf = ((t_soi[:, 0]*0.0175 + t_soi[:, 1]*0.0276) / wtot)
+        # wc_surf = (wliq_soi[:, 0] + wliq_soi[:, 1]) / (wtot * 1000.0)
+        # t_deep = ((t_soi[:, 6]*(0.8289-0.5) + t_soi[:, 7]*(1.0-0.8289)) / 0.5)
+        wtot = 0.0175
+        t_surf = t_soi[:, 0]
+        wc_surf = wliq_soi[:, 0] / (wtot * 1000.0)   
+        t_deep =  t_soi[:, -1]
+        bd_surf = bd_all_tensor[:, 0] / 1000.0    
         
-        clay_surf_pct = (clay_all[:, 0]*0.0175 + clay_all[:, 1]*0.0276) / wtot 
-        sand_surf_pct = (sand_all[:, 0]*0.0175 + sand_all[:, 1]*0.0276) / wtot  
-        clay_surf = clay_surf_pct / 100.0 
-        
+        # 计算10层土壤的最大温度 (沿维度1求最大值)
+        t_soi_max = torch.max(t_soi, dim=1)[0]
+        # 计算10层土壤的最小温度 (沿维度1求最小值)
+        t_soi_min = torch.min(t_soi, dim=1)[0]
+
+        # clay_surf_pct = (clay_all[:, 0]*0.0175 + clay_all[:, 1]*0.0276) / wtot 
+        # sand_surf_pct = (sand_all[:, 0]*0.0175 + sand_all[:, 1]*0.0276) / wtot  
+        # clay_surf = clay_surf_pct / 100.0 
+        clay_surf_pct = clay_all[:, 0] 
+        clay_surf = clay_surf_pct / 100.0
+        sand_surf_pct = sand_all[:, 0]
         # 计算 M09 方案的最大结合水含量 (mvt)
         mvt_surf = 0.02863 + 0.30673e-2 * clay_surf_pct
-        
-        bd_surf = (bd_all_tensor[:, 0]*0.0175 + bd_all_tensor[:, 1]*0.0276) / wtot / 1000.0
         
         eps = rtm_model.diel_soil_M09(wc_all, t_soi - rtm_model.tfrz, clay_all, f)
         eps_surf = rtm_model.diel_soil_M09(wc_surf, t_surf - rtm_model.tfrz, clay_surf_pct, f)
@@ -201,7 +217,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             eps_surf_r = eps_surf.real
             eps_surf_i = torch.abs(eps_surf.imag)
             
-            # --- 新增逻辑: 依据 Holmes 公式 C = (eps_ratio / eps0_param)**b_param 反推 b_param ---
+            # --- 新增 logic: 依据 Holmes 公式 C = (eps_ratio / eps0_param)**b_param 反推 b_param ---
             eps0_param = 0.08
             eps_ratio = eps_surf_i / eps_surf_r
             eps_ratio_norm = torch.clamp(eps_ratio / eps0_param, min=1e-5)
@@ -233,6 +249,11 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         out_dict['sand_surf'].append(sand_surf_pct.cpu().numpy())  
         out_dict['bd_surf'].append((bd_surf * 1000.0).cpu().numpy()) 
         out_dict['t_deep'].append(t_deep.cpu().numpy())
+        
+        # 将最大土壤温度存入对应插槽
+        out_dict['t_soi_max'].append(t_soi_max.cpu().numpy())
+        out_dict['t_soi_min'].append(t_soi_min.cpu().numpy())
+        
         out_dict['eps_surf_real'].append(eps_surf.real.cpu().numpy())
         out_dict['eps_surf_imag'].append(eps_surf.imag.cpu().numpy())
         
@@ -241,6 +262,10 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         out_dict['C_inverted_wilheit'].append(C_inverted.cpu().numpy())
         out_dict['b_param_inverted'].append(b_param_inverted.cpu().numpy())
         out_dict['dz_surf_inverted'].append(dz_surf_inverted.cpu().numpy())
+        
+        # 循环保存 10 层土壤的独立温度
+        for layer in range(10):
+            out_dict[f't_soi_layer_{layer+1}'].append(t_soi[:, layer].cpu().numpy())
 
     print(f"GPU Computing completed in {time.time() - t_compute_start:.2f} seconds.")
 
@@ -268,7 +293,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     diff_holmes_abs = np.abs(final_df['T_eff_holmes2006'] - final_df['T_eff_wilheit_H'])
 
     # 1. 筛选出大误差样本 (Holmes 绝对差异大于 5K)
-    large_loss_threshold = 5.0  
+    large_loss_threshold = 2.0  
     large_loss_mask = (diff_holmes_abs > large_loss_threshold)
     large_loss_df = final_df[large_loss_mask]
     
@@ -415,7 +440,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     stats_csv_filename = f"Teff_stats_summary_{time_format_str}.csv"
     summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
     print(f"Multi-condition statistics summary table successfully saved to CSV: {stats_csv_filename}")
-
+    
     # plt.tight_layout()
     # plot_filename = f"Teff_diff_map_{time_format_str}.png"
     # plt.savefig(os.path.join(output_dir, plot_filename), dpi=300)
@@ -423,10 +448,8 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     # print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
 
 if __name__ == "__main__":
-    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_1'
+    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_2'
     t0 = time.time()
     for month in range(1, 13):
         main(2016, month, 1, 0, output_dir=output_dir)
         print(f"Month {month} completed in {time.time()-t0:.2f} seconds")
-        
-        # break
