@@ -60,7 +60,6 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             lat = lat[valid_mask]
             patchclass = patchclass[valid_mask]
             
-            # 修改为以下内容：
             t_soisno = dataset.variables['t_soisno'][time_idx, valid_mask, :]
             wliq_soisno = dataset.variables['wliq_soisno'][time_idx, valid_mask, :]
             wf_clay = dataset.variables['wf_clay'][valid_mask, :]
@@ -104,12 +103,32 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
 
             # Unpack all variables
             r_h, r_v, teff_wilheit_h, teff_wilheit_v = rtm_model.eff_soil_temp_Wilheit(dz_soi, t_soi, eps, t_theta, lamcm)
-            teff_lv_multi = rtm_model.eff_soil_temp_Lv_multi(dz_soi, t_soi, eps, t_lam)
-            # Lv Two-layer: 使用整合后的表层参数和深层温度 (传入表层厚度 wtot = 0.0451)
-            teff_lv_two = rtm_model.eff_soil_temp_Lv_two(wtot, t_surf, t_deep, eps_surf, t_lam)
+            
+            # 提取 lv_multi 的权重以计算 90% 穿透深度
+            teff_lv_multi, weights_lv = rtm_model.eff_soil_temp_Lv_multi(dz_soi, t_soi, eps, t_lam, return_weights=True)
+            
+            cum_dz = torch.cumsum(dz_soi, dim=1)                 
+            cum_weights = torch.cumsum(weights_lv, dim=1)        
+            
+            idx_90 = torch.argmax((cum_weights >= 0.9).int(), dim=1, keepdim=True)
+            cw_i = torch.gather(cum_weights, 1, idx_90).squeeze(1)
+            dz_i = torch.gather(dz_soi, 1, idx_90).squeeze(1)
+            
+            pad_cw = torch.cat([torch.zeros_like(cum_weights[:, :1]), cum_weights], dim=1)
+            pad_cdz = torch.cat([torch.zeros_like(cum_dz[:, :1]), cum_dz], dim=1)
+            
+            cw_prev = torch.gather(pad_cw, 1, idx_90).squeeze(1)
+            cdz_prev = torch.gather(pad_cdz, 1, idx_90).squeeze(1)
+            
+            weight_diff = torch.clamp(cw_i - cw_prev, min=1e-8) 
+            depth_90 = cdz_prev + (0.9 - cw_prev) / weight_diff * dz_i
+            
+            # Lv Two-layer (多返回 C 值)
+            teff_lv_two, C_lv_two = rtm_model.eff_soil_temp_Lv_two(wtot, t_surf, t_deep, eps_surf, t_lam, return_C=True)
             teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
-            # Holmes: 统一使用刚刚新计算的整体表层介电常数 eps_surf
-            teff_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(eps_surf, t_surf, t_deep)
+            
+            # Holmes 2006 (多返回 C 值)
+            teff_holmes2006, C_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(eps_surf, t_surf, t_deep, return_C=True)
             teff_wigneron2008 = rtm_model.eff_soil_temp_Wigneron2008(wc_surf, t_surf, t_deep, clay_surf, bd_surf)
 
             df_batch = pd.DataFrame({
@@ -123,8 +142,11 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
                 'T_eff_lv_multi': teff_lv_multi.cpu().numpy(),
                 'T_eff_lv_two': teff_lv_two.cpu().numpy(),
                 'T_eff_wigneron': teff_wigneron.cpu().numpy(),
-                'T_eff_holmes2006': teff_holmes2006.cpu().numpy(),       # 【新增】
-                'T_eff_wigneron2008': teff_wigneron2008.cpu().numpy()    # 【新增】
+                'T_eff_holmes2006': teff_holmes2006.cpu().numpy(),       
+                'T_eff_wigneron2008': teff_wigneron2008.cpu().numpy(),   
+                'depth_90_lv_multi': depth_90.cpu().numpy(),            # 【保留】
+                'C_lv_two': C_lv_two.cpu().numpy(),                     # 【新增】
+                'C_holmes2006': C_holmes2006.cpu().numpy()              # 【新增】
             })
             all_results.append(df_batch)
 
@@ -138,93 +160,100 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     final_df.to_csv(os.path.join(output_dir, csv_filename), index=False)
     print(f"Calculation finished successfully. Saved data table to: {csv_filename}\n")
 
-    # Expanded to 4 rows and 2 columns subplot layout
-    # 扩展为 6行2列的布局 (为了容纳新增的4个对比图)
-    fig, axs = plt.subplots(6, 2, figsize=(16, 32))
+    # ==================================================
+    # GRID PLOT LAYOUT (4 rows, 2 columns)
+    # ==================================================
+    fig, axs = plt.subplots(4, 2, figsize=(20, 24))
     plot_configs = [
-        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "row_idx": 0, "col_idx": 0, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_V", "title": "Lv Multi-layer - Wilheit (V)", "row_idx": 0, "col_idx": 1, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_H", "title": "Lv Two-layer - Wilheit (H)", "row_idx": 1, "col_idx": 0, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_V", "title": "Lv Two-layer - Wilheit (V)", "row_idx": 1, "col_idx": 1, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "row_idx": 2, "col_idx": 0, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_V", "title": "Wigneron 2001 - Wilheit (V)", "row_idx": 2, "col_idx": 1, "is_temp": True, "is_unified": True},
+        # 1. 保留的前5副差异图（针对 Wilheit H），统一范围 -20 到 20
+        {"col": "T_eff_lv_multi", "ref": "T_eff_wilheit_H", "title": "Lv Multi-layer - Wilheit (H)", "type": "diff", "is_temp": True, "vmin": -20.0, "vmax": 20.0},
+        {"col": "T_eff_lv_two", "ref": "T_eff_wilheit_H", "title": "Lv Two-layer - Wilheit (H)", "type": "diff", "is_temp": True, "vmin": -20.0, "vmax": 20.0},
+        {"col": "T_eff_wigneron", "ref": "T_eff_wilheit_H", "title": "Wigneron 2001 - Wilheit (H)", "type": "diff", "is_temp": True, "vmin": -20.0, "vmax": 20.0},
+        {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_H", "title": "Wigneron 2008 - Wilheit (H)", "type": "diff", "is_temp": True, "vmin": -20.0, "vmax": 20.0},
+        {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_H", "title": "Holmes 2006 - Wilheit (H)", "type": "diff", "is_temp": True, "vmin": -20.0, "vmax": 20.0},
         
-        # 【新增】Wigneron 2008 方案对比
-        {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_H", "title": "Wigneron 2008 - Wilheit (H)", "row_idx": 3, "col_idx": 0, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_wigneron2008", "ref": "T_eff_wilheit_V", "title": "Wigneron 2008 - Wilheit (V)", "row_idx": 3, "col_idx": 1, "is_temp": True, "is_unified": True},
+        # 2. 新增的3副绝对数值图
+        # 第六副：深度，平均0.0628，极值到1。设置 vmax=0.2 搭配 extend='max' 显示最佳。
+        {"col": "depth_90_lv_multi", "title": "90% Penetration Depth (Lv Multi)", "type": "value", "unit": "m", "cmap": "viridis", "vmin": 0.0, "vmax": 0.2, "extend": "max"},
         
-        # 【新增】Holmes 2006 方案对比
-        {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_H", "title": "Holmes 2006 - Wilheit (H)", "row_idx": 4, "col_idx": 0, "is_temp": True, "is_unified": True},
-        {"col": "T_eff_holmes2006", "ref": "T_eff_wilheit_V", "title": "Holmes 2006 - Wilheit (V)", "row_idx": 4, "col_idx": 1, "is_temp": True, "is_unified": True},
-        
-        {"col": "T_eff_wilheit_H", "ref": "T_eff_wilheit_V", "title": "Wilheit (H) - Wilheit (V)", "row_idx": 5, "col_idx": 0, "is_temp": True, "is_unified": False},
-        {"col": "r_H_wilheit", "ref": "r_V_wilheit", "title": "Wilheit r_H - Wilheit r_V", "row_idx": 5, "col_idx": 1, "is_temp": False, "is_unified": False}
+        # 第七、第八副：C值 0到1
+        {"col": "C_holmes2006", "title": "C Value (Holmes 2006)", "type": "value", "unit": "-", "cmap": "plasma", "vmin": 0.0, "vmax": 1.0, "extend": "neither"},
+        {"col": "C_lv_two", "title": "C Value (Lv Two-layer)", "type": "value", "unit": "-", "cmap": "plasma", "vmin": 0.0, "vmax": 1.0, "extend": "neither"}
     ]
 
-    # Pre-calculate unified range for plots 1-6
-    global_max_abs = 0.0
-    for cfg in plot_configs:
-        if cfg["is_unified"]:
-            diff = final_df[cfg["col"]] - final_df[cfg["ref"]]
-            max_abs = max(abs(diff.min()), abs(diff.max()))
-            if max_abs > global_max_abs:
-                global_max_abs = max_abs
-    if global_max_abs == 0:
-        global_max_abs = 1e-4
-
-    # ==================================================
-    # CONSTRUCT SUMMARY TABLE & PLOT
-    # ==================================================
     stats_list = []
 
-    for cfg in plot_configs:
-        diff = final_df[cfg["col"]] - final_df[cfg["ref"]]
+    for i, cfg in enumerate(plot_configs):
+        row_idx = i // 2
+        col_idx = i % 2
+        ax = axs[row_idx, col_idx]
         
-        mean_bias = diff.mean()
-        std_dev = diff.std()
-        rmse_val = np.sqrt((diff ** 2).mean())
-        min_diff = diff.min()
-        max_diff = diff.max()
-        unit_str = "K" if cfg["is_temp"] else "-"
-        
-        # 将单位作为独立列，使 CSV 结构更为规整
-        stats_list.append({
-            "Scheme Profile": cfg["title"],
-            "Total Patches": len(diff),
-            "Unit": unit_str,
-            "MBE": round(mean_bias, 4),
-            "SD": round(std_dev, 4),
-            "RMSE": round(rmse_val, 4),
-            "Min Diff": round(min_diff, 4),
-            "Max Diff": round(max_diff, 4)
-        })
-        
-        # # 绘图逻辑
-        ax = axs[cfg["row_idx"], cfg["col_idx"]]
-        vmin, vmax = (-global_max_abs, global_max_abs) if cfg["is_unified"] else (-max(abs(min_diff), abs(max_diff)) or -1e-4, max(abs(min_diff), abs(max_diff)) or 1e-4)
+        if cfg["type"] == "diff":
+            val = final_df[cfg["col"]] - final_df[cfg["ref"]]
+            mean_val = val.mean()
+            std_dev = val.std()
+            rmse_val = np.sqrt((val ** 2).mean())
+            min_val = val.min()
+            max_val = val.max()
+            unit_str = "K" if cfg["is_temp"] else "-"
             
-        sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
-                        c=diff, cmap='coolwarm', s=1, vmin=-10, vmax=10)
-        
-        ax.set_title(f"{cfg['title']}\n(RMSE: {rmse_val:.4f}{unit_str}, Bias: {mean_bias:.4f}{unit_str})")
+            stats_list.append({
+                "Scheme Profile": cfg["title"],
+                "Total Patches": len(val),
+                "Unit": unit_str,
+                "Mean/MBE": round(mean_val, 4),
+                "SD": round(std_dev, 4),
+                "RMSE": round(rmse_val, 4),
+                "Min": round(min_val, 4),
+                "Max": round(max_val, 4)
+            })
+            
+            sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
+                            c=val, cmap='coolwarm', s=1, vmin=cfg["vmin"], vmax=cfg["vmax"])
+            ax.set_title(f"{cfg['title']}\n(RMSE: {rmse_val:.4f}{unit_str}, Bias: {mean_val:.4f}{unit_str})")
+            cb_label = 'T_eff Difference (K)' if cfg["is_temp"] else 'Reflectivity Difference (-)'
+            # 对称误差图加上 extend='both' 显示超出 -20 和 20 的极值
+            plt.colorbar(sc, ax=ax, label=cb_label, extend='both')
+            
+        else:
+            # 对于绝对数值的物理量（深度，C值）
+            val = final_df[cfg["col"]]
+            mean_val = val.mean()
+            std_dev = val.std()
+            min_val = val.min()
+            max_val = val.max()
+            unit_str = cfg["unit"]
+            
+            stats_list.append({
+                "Scheme Profile": cfg["title"],
+                "Total Patches": len(val),
+                "Unit": unit_str,
+                "Mean/MBE": round(mean_val, 4),
+                "SD": round(std_dev, 4),
+                "RMSE": "-",
+                "Min": round(min_val, 4),
+                "Max": round(max_val, 4)
+            })
+            
+            sc = ax.scatter(final_df['patch_lon'], final_df['patch_lat'], 
+                            c=val, cmap=cfg["cmap"], s=1, vmin=cfg["vmin"], vmax=cfg["vmax"])
+            ax.set_title(f"{cfg['title']}\n(Mean: {mean_val:.4f} {unit_str})")
+            plt.colorbar(sc, ax=ax, label=f'{cfg["title"]} ({unit_str})', extend=cfg.get("extend", "neither"))
+
         ax.set_ylabel('Latitude')
         ax.set_xlabel('Longitude')
-        cb_label = 'T_eff Difference (K)' if cfg["is_temp"] else 'Reflectivity Difference (-)'
-        plt.colorbar(sc, ax=ax, label=cb_label)
 
     # 转换为统计 DataFrame
     summary_df = pd.DataFrame(stats_list)
     
     # 终端打印展示
-    print("\n" + "="*80)
-    print(f" ERROR DISTRIBUTION SUMMARY TABLE ({time_format_str})")
-    print("="*80)
-    # pd.set_option('display.max_columns', None)
-    # pd.set_option('display.width', 1000)
+    print("\n" + "="*85)
+    print(f" ERROR DISTRIBUTION & VARIABLE SUMMARY TABLE ({time_format_str})")
+    print("="*85)
     print(summary_df.to_string(index=False))
-    print("="*80 + "\n")
+    print("="*85 + "\n")
     
-    # 修改处：将误差统计结果保存为标准的 CSV 文件而不再是 XLSX
+    # 保存误差统计结果
     stats_csv_filename = f"Teff_stats_summary_{time_format_str}.csv"
     summary_df.to_csv(os.path.join(output_dir, stats_csv_filename), index=False)
     print(f"Statistics summary table successfully saved to CSV: {stats_csv_filename}")
@@ -246,8 +275,3 @@ if __name__ == "__main__":
         # for day in range(1, days_in_month + 1):
         #     for hour in range(24):
         #         main(2016, month, day, hour, output_dir=output_dir)
-
-
-
-
-
