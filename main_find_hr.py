@@ -23,7 +23,7 @@ from step_5_1 import process_single_grid  # 确保这个函数返回了我们需
 from rtm import DifferentiableRTM
 import sys
     
-from GA import GA  # 确保 GA.py 在同一目录下
+
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -372,6 +372,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     print(f'RTM计算与CoLM,H亮温误差:', torch.sqrt(criterion(tb_h_sim, t_brt_smap_h)).item(), 'V亮温误差:', torch.sqrt(criterion(tb_v_sim, t_brt_smap_v)).item(),'平均误差:', (torch.sqrt(criterion(tb_h_sim, t_brt_smap_h)).item() + torch.sqrt(criterion(tb_v_sim, t_brt_smap_v)).item())/2.0)
     print(f'RTM计算与观测,H亮温误差:', torch.sqrt(criterion(tb_h_sim, obs_tb_h)).item(), 'V亮温误差:', torch.sqrt(criterion(tb_v_sim, obs_tb_v)).item(),'平均误差:', (torch.sqrt(criterion(tb_h_sim, obs_tb_h)).item() + torch.sqrt(criterion(tb_v_sim, obs_tb_v)).item())/2.0  )
 
+    sys.exit()
 
     tb_h_sim = tb_toa_h_patch.view(time_dim, patch_dim).mean(dim=1)
     tb_v_sim = tb_toa_v_patch.view(time_dim, patch_dim).mean(dim=1)
@@ -406,7 +407,8 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
             best_hr = 1.667 + delta_hr
     
     print(f'best_loss: {best_loss} | best_hr: {best_hr}')
-    # sys.exit(0) # 根据你的测试需求，可以保留或去掉 sys.exit(0)
+    
+    sys.exit(0) # 根据你的测试需求，可以保留或去掉 sys.exit(0)
     
     sm_array = sm_all.detach().cpu().numpy()
     b_array = rtm_model.b_array.detach().cpu().numpy()
@@ -506,14 +508,17 @@ if __name__ == "__main__":
     INDEX_FILE = '/home/liusy/storage_global_veg_wigneron/nc_patch_location_index.csv'
     csv_dir = '/home/liusy/store_global_forward/tb_for_EASE_open_lands'
     patch_map_file = '/home/liusy/storage_global_veg_wigneron/patch_map_EASE_open_lands.csv' 
-    nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron_M04/forward_inputs_folder'
-    output_dir="/home/liusy/2026-05-20_research_list/tb_calibrate_try"
+    nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
+    output_dir="/home/liusy/research_lists/2026-05-20_research_list/tb_calibrate_try"
     
     print("正在加载全局 NC 索引表...")
     df_nc_index = pd.read_csv(INDEX_FILE)
     csv_files = glob.glob(os.path.join(csv_dir, '*.csv'))
     
     positions = [
+    "lat_25.529726_lon_-98.77593",
+    "lat_20.024717_lon_-5.041494",
+    "lat_20.626143_lon_40.518673",
     "lat_48.579163_lon_92.05394",
     'lat_-19.72485_lon_141.72198', 
     "lat_-19.72485_lon_141.34854",
@@ -557,7 +562,7 @@ if __name__ == "__main__":
     
     set_seed(seed=42)  
     
-    for grid_id, position in enumerate(positions[1:]):  
+    for grid_id, position in enumerate(positions[0:]):  
         
         target_csv = os.path.join(csv_dir, f"{position}_SMAP_TB.csv") 
         ease_lat, ease_lon = map(float, os.path.basename(target_csv).split('_')[1:4:2])
