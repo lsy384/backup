@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import pandas as pd
 
 class DifferentiableRTM(nn.Module):
     def __init__(self, def_da_rtm_diel=0, def_da_rtm_rough=0, def_da_rtm_veg=0, num_grids=1, maxsnl=5):
@@ -283,13 +284,26 @@ class DifferentiableRTM(nn.Module):
         eps_soil_d = torch.complex(eps_soil_d_real, eps_soil_d_imag)
         
         eps_soil = torch.where(is_desert, eps_soil_d, eps_soil_nd)
+        t_eff_wigneron = self.eff_soil_temp_Wigneron2001(liq_surf, t_surf + self.tfrz, t_deep + self.tfrz)
+        t_eff_holmes = self.eff_soil_temp_Holmes2006(eps_soil_nd, t_surf+ self.tfrz, t_deep+ self.tfrz)
         
         # 利用 Lv 模型计算多层有效温度，此处将 10 层的 pred 矩阵完整传入
-        t_eff = self.eff_soil_temp_Lv(dz_soi, t_soi, wliq_soi, f, lam, wf_clay,
-                                      znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,
-                                      )
-                                      
-        self.t_eff = t_eff
+        # t_eff = self.eff_soil_temp_Lv(dz_soi, t_soi, wliq_soi, f, lam, wf_clay,
+        #                               znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,
+        #                               )
+        
+                            
+        eps_soil_all = self.diel_soil_Debye_framework(wliq_soi, f.unsqueeze(1),
+                                                      znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,)
+        t_eff = self.eff_soil_temp_Wilheit(dz_soi, t_soi, eps_soil_all, theta, lam*100)[3]  # Wilheit 模型需要 cm 单位的波长
+        print('np.min(t_eff), np.max(t_eff)',torch.min(t_eff), torch.max(t_eff))
+        print('Wigneron跟wilheit的Bias', (t_eff_wigneron - t_eff).mean().item())
+        print('Wigneron跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_wigneron, t_eff)).item())
+        print('Holmes跟wilheit的Bias', (t_eff_holmes - t_eff).mean().item())
+        print('Holmes跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_holmes, t_eff)).item())
+        
+        pd.DataFrame({'t_eff_wigneron': t_eff_wigneron.cpu().numpy(), 't_eff_wilheit': t_eff.cpu().numpy(), 't_eff_holmes': t_eff_holmes.cpu().numpy()}).\
+        to_csv('t_eff_comparison_wigneron_and_wilheit.csv', index=False)
         
         g = torch.sqrt(eps_soil - torch.sin(theta)**2)
         r_s_h = torch.abs((torch.cos(theta) - g)/(torch.cos(theta) + g))**2
@@ -308,6 +322,221 @@ class DifferentiableRTM(nn.Module):
         self.tb_soil = tb_soil
             
         return r_r, tb_soil
+    
+
+    def eff_soil_temp_Wilheit(self, dz_soi, t_soi, eps, theta, lamcm):
+        """
+        Calculate effective soil temperature using Wilheit 1978 coherent model.
+        Strictly aligned with CMEM's wilheit_sub.F90 (Returns BOTH H and V polarizations & reflectivities).
+        """
+        batch_size = eps.shape[0]
+        nlay = eps.shape[1]
+        N = nlay + 1
+        device = eps.device
+
+        # 1. Calculate index of refraction (Atmosphere index = 1.0)
+        CN = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        CN[:, 0] = 1.0 + 0.0j
+        CN[:, 1:] = torch.sqrt(eps)
+
+        DEL = torch.zeros((batch_size, N), device=device)
+        DEL[:, 1:] = dz_soi * 100.0
+
+        # 2. Calculate squares of interface propagators (CP) - Shared for H and V
+        S = torch.sin(theta)
+        CP = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        CP[:, 0] = 1.0 + 0.0j
+        
+        propagation_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        for i in range(1, N-1):
+            CS = CN[:, 0] * S / CN[:, i]
+            CC = torch.sqrt(1.0 + 0.0j - CS*CS)
+            ARG = DEL[:, i] * 2.0 * self.pi / lamcm
+            CARG = 2.0 * ARG * CN[:, i] * CC * 1.0j
+            
+            CP_next = torch.exp(CARG) * CP[:, i-1]
+            CP[:, i] = torch.where(propagation_mask, CP_next, torch.zeros_like(CP_next))
+            
+            # Match Fortran exactly: IF (ABS(CP(I)) < 0.0001) EXIT
+            propagation_mask = propagation_mask & (torch.abs(CP[:, i]) >= 0.0001)
+
+        # 3. Calculate electric fields within each layer (Backward loop)
+        CEP_h = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        CEM_h = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        CEP_v = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        CEM_v = torch.zeros((batch_size, N), dtype=torch.complex64, device=device)
+        
+        CEP_h[:, N-1] = 1.0 + 0.0j
+        CEP_v[:, N-1] = 1.0 + 0.0j
+
+        # FIX: Loop boundary extended to N+1 to ensure j reaches 0 (Atmosphere interface)
+        for ii in range(2, N + 1):
+            j = N - ii
+            CSJ = CN[:, 0] * S / CN[:, j]
+            CCJ = torch.sqrt(1.0 + 0.0j - CSJ*CSJ)
+            CSJP1 = CN[:, 0] * S / CN[:, j+1]
+            CCJP1 = torch.sqrt(1.0 + 0.0j - CSJP1*CSJP1)
+
+            cp_abs = torch.abs(CP[:, j])
+            safe_cp = torch.where(cp_abs < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CP[:, j])
+
+            # --- HPLD (Horizontal) Equations ---
+            CA_h = 2.0 * CN[:, j] * CCJ / (CN[:, j]*CCJ + CN[:, j+1]*CCJP1)
+            CB_h = (CN[:, j]*CCJ - CN[:, j+1]*CCJP1) / ((CN[:, j]*CCJ + CN[:, j+1]*CCJP1) * safe_cp)
+
+            CEP_h_j = CEP_h[:, j+1]/CA_h + CB_h*CEM_h[:, j+1]/CA_h
+            CEM_h_j = CEM_h[:, j+1] + (CEP_h[:, j+1] - CEP_h_j)*CP[:, j]
+
+            # --- VPLD (Vertical) Equations ---
+            CD_v = 2.0 * CN[:, j] * CCJ
+            CA_v = CN[:, j]*CCJP1 + CN[:, j+1]*CCJ
+            CB_v = CN[:, j]*CCJP1 - CN[:, j+1]*CCJ
+            
+            CEP_v_j = CA_v*CEP_v[:, j+1]/CD_v + CB_v*CEM_v[:, j+1]/(CD_v*safe_cp)
+            CR_v = CN[:, j+1] / CN[:, j]
+            CEM_v_j = CR_v*CEM_v[:, j+1] + (CEP_v_j - CEP_v[:, j+1]*CR_v)*CP[:, j]
+            
+            # Masking to simulate Fortran's NMAX behavior
+            CEP_h[:, j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEP_h_j), CEP_h_j)
+            CEM_h[:, j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEM_h_j), CEM_h_j)
+            CEP_v[:, j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEP_v_j), CEP_v_j)
+            CEM_v[:, j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEM_v_j), CEM_v_j)
+
+        # Normalize electric fields by the top atmospheric field (CX)
+        CX_h_stable = torch.where(torch.abs(CEP_h[:, 0]) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CEP_h[:, 0])
+        CX_v_stable = torch.where(torch.abs(CEP_v[:, 0]) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CEP_v[:, 0])
+        
+        for j in range(N):
+            CEP_h[:, j] = CEP_h[:, j] / CX_h_stable
+            CEM_h[:, j] = CEM_h[:, j] / CX_h_stable
+            CEP_v[:, j] = CEP_v[:, j] / CX_v_stable
+            CEM_v[:, j] = CEM_v[:, j] / CX_v_stable
+
+        # 4. Calculate layer absorption fractions (fa_h and fa_v)
+        fa_h = torch.zeros((batch_size, nlay), device=device)
+        fa_v = torch.zeros((batch_size, nlay), device=device)
+        cos_theta = torch.cos(theta)
+
+        # FIX: Loop boundary extended to N to ensure j reaches 1 (Top soil layer absorption)
+        for ii in range(1, N):
+            j = N - ii
+            CS = S / CN[:, j]
+            CC = torch.sqrt(1.0 + 0.0j - CS*CS)
+            
+            R = torch.abs(CP[:, j])
+            S_abs = torch.abs(CP[:, j-1])
+            valid_layer = (R > 1e-12) & (S_abs > 1e-12)
+            
+            # HPLD Absorption
+            E2_h = (S_abs - R) * torch.abs(CEP_h[:, j])**2 + (1.0/R - 1.0/S_abs) * torch.abs(CEM_h[:, j])**2
+            DP_h = E2_h * (CN[:, j]*CC).real / cos_theta
+            CXP_h = CEP_h[:, j] * torch.conj(CEM_h[:, j])
+            X_h = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_h * CP[:, j-1]/S_abs).imag - (CXP_h * CP[:, j]/R).imag )
+            fa_h[:, j-1] = torch.where(valid_layer, DP_h - X_h, torch.tensor(0.0, device=device))
+            
+            # VPLD Absorption
+            E2_v = (S_abs - R) * torch.abs(CEP_v[:, j])**2 + (1.0/R - 1.0/S_abs) * torch.abs(CEM_v[:, j])**2
+            DP_v = E2_v * (CN[:, j]*CC).real / cos_theta
+            CXP_v = CEP_v[:, j] * torch.conj(CEM_v[:, j])
+            X_v = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_v * CP[:, j-1]/S_abs).imag - (CXP_v * CP[:, j]/R).imag )
+            fa_v[:, j-1] = torch.where(valid_layer, DP_v - X_v, torch.tensor(0.0, device=device))
+
+        # Cleanup numeric instabilities
+        fa_h = torch.where(torch.isnan(fa_h) | torch.isinf(fa_h) | (fa_h < 0), torch.tensor(0.0, device=device), fa_h)
+        fa_v = torch.where(torch.isnan(fa_v) | torch.isinf(fa_v) | (fa_v < 0), torch.tensor(0.0, device=device), fa_v)
+
+        # 5. Compute effective soil temperature and reflectivity
+        sum_fa_h = torch.sum(fa_h, dim=1)
+        teff_h = torch.where(sum_fa_h == 0, t_soi[:, 0], torch.sum(fa_h * t_soi, dim=1) / torch.where(sum_fa_h == 0, torch.tensor(1.0, device=device), sum_fa_h))
+        
+        sum_fa_v = torch.sum(fa_v, dim=1)
+        teff_v = torch.where(sum_fa_v == 0, t_soi[:, 0], torch.sum(fa_v * t_soi, dim=1) / torch.where(sum_fa_v == 0, torch.tensor(1.0, device=device), sum_fa_v))
+
+        # Reflectivities from the top layer (Atmosphere)
+        r_h = torch.abs(CEM_h[:, 0])**2 * CN[:, 0].real
+        r_v = torch.abs(CEM_v[:, 0])**2 * CN[:, 0].real
+        
+        return r_h, r_v, teff_h, teff_v
+    
+
+    def eff_soil_temp_Lv_multi(self, dz_soi, t_soi, eps, lam):
+        # Calculate effective temperature using Lv multi-layer discrete scheme
+        eps_r = eps.real
+        eps_i = torch.abs(eps.imag)
+        lam_2d = lam.unsqueeze(1) if lam.dim() == 1 else lam
+        
+        B_i = dz_soi * (4.0 * self.pi / lam_2d) * (eps_i / (2.0 * torch.sqrt(eps_r)))
+        exp_B = torch.exp(-B_i)
+        
+        tau_top = torch.cat([torch.zeros_like(B_i[:, :1]), torch.cumsum(B_i[:, :-1], dim=1)], dim=1)
+        prod_term = torch.exp(-tau_top)
+        
+        weights = (1.0 - exp_B) * prod_term
+        weights[:, -1] = prod_term[:, -1]
+        
+        return torch.sum(t_soi * weights, dim=1)
+
+    def eff_soil_temp_Lv_two(self, dz_surf, t_surf, t_deep, eps_surf, lam):
+        # Calculate effective temperature using Lv two-layer scheme
+        eps_r = eps_surf.real
+        eps_i = torch.abs(eps_surf.imag)
+        lam_val = lam.unsqueeze(1) if lam.dim() == 1 else lam
+        
+        # 此时 dz_surf 传入的是一个标量 (wtot)
+        B1 = dz_surf * (4.0 * self.pi / lam_val.squeeze(-1)) * (eps_i / (2.0 * torch.sqrt(eps_r)))
+        
+        # 统一使用外部算好的表层和深层温度
+        teff = t_surf * (1.0 - torch.exp(-B1)) + t_deep * torch.exp(-B1)
+        return teff
+
+    def eff_soil_temp_Wigneron2001(self, wc_surf, t_surf, t_deep):
+        # Calculate effective temperature using Wigneron 2001 scheme
+        w0 = 0.30
+        bw = 0.30
+        C = torch.clamp((wc_surf / w0)**bw, min=0.001)
+        C = torch.where(wc_surf < 0.0, torch.full_like(C, 0.001), C)
+        teff = t_deep + (t_surf - t_deep) * C
+        return teff
+    
+    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep):
+        """
+        Holmes 2006 model (基于介电常数比值的参数化)
+        eps_surf: 表层复介电常数 (complex)
+        """
+        eps_r = eps_surf.real
+        eps_i = torch.abs(eps_surf.imag)
+        
+        # 2003-2004 interannual calibration parameters
+        eps0_param = 0.08
+        b_param = 0.87
+        
+        # C(eps) = ((eps'' / eps') / eps0_param)^b
+        eps_ratio = eps_i / eps_r
+        C = (eps_ratio / eps0_param) ** b_param
+        # 限制 C 的范围在 [0, 1] 之间，防止极端干燥条件下的非物理外推
+        C = torch.clamp(C, min=0.0, max=1.0)
+        
+        teff = t_deep + (t_surf - t_deep) * C
+        return teff
+
+    def eff_soil_temp_Wigneron2008(self, wc_surf, t_surf, t_deep, clay_frac, bulk_density):
+        """
+        Wigneron 2008 '4P' model for T_surf at 2cm (引入质地和容重)
+        wc_surf: 表层体积含水量 (m3/m3)
+        clay_frac: 表层黏粒比例 (fraction, 0~1)
+        bulk_density: 表层土壤容重 (g/cm3)
+        """
+        w0 = 0.5996
+        # b = b1 + b3*C + b4*rho_b
+        b = 0.3955 - 0.2803 * clay_frac - 0.10849 * bulk_density
+        
+        C_param = torch.clamp((wc_surf / w0)**b, min=0.001, max=1.0)
+        C_param = torch.where(wc_surf < 0.0, torch.full_like(C_param, 0.001), C_param)
+        
+        teff = t_deep + (t_surf - t_deep) * C_param
+        return teff
+    
     
     def eff_soil_temp_Lv(self, dz_soi, t_soi, wc_soi, f, lam, wf_clay,
                          znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,
@@ -564,7 +793,7 @@ class DifferentiableRTM(nn.Module):
         sigmab = sigmabt + Bsgb * (t - ts)
 
         # --- unbound (free) water parameters ---
-        e0u = 100.0
+        e0u = torch.tensor(100.0, dtype=torch.float32, device=wf_clay.device)
         Bu = (1.11e-4 - 1.603e-7 * wf_clay + 1.239e-9 * (wf_clay ** 2)
             + 8.33e-13 * (wf_clay ** 3) - 1.007e-14 * (wf_clay ** 4))
         Bsgu = (0.00108 + 0.1413e-2 * wf_clay - 0.2555e-4 * (wf_clay ** 2)
