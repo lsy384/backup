@@ -536,7 +536,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
 
     loss_array_stage1 = []    
     loss_array_stage2 = []
-    epochs = 10000
+    epochs = 50000
     patience = 5000 
     whether_patience = True
     t0 = time.time()
@@ -836,16 +836,15 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
 if __name__ == "__main__":
     INDEX_FILE = 'nc_patch_location_index.csv'
     csv_dir = '/home/liusy/store_global_forward/tb_for_EASE_open_lands'
-    patch_map_file = '/home/liusy/storage_global_veg_wigneron/patch_map_EASE_open_lands_one_by_one.csv' 
+    patch_map_file = '/home/liusy/storage_global_veg_wigneron/patch_map_EASE_open_lands.csv' 
     nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
     output_dir = "/home/liusy/storage_global_veg_wigneron/tb_calibrate_try_1"
-    csv_files = open('csv_files_list_for_training_1.csv', encoding='utf-8').read().splitlines()[700:]
+    csv_files = open('csv_files_list_for_training.csv', encoding='utf-8').read().splitlines()
     # 定义输出结果文件
-    output_result_csv = 'grid_loss_results_1.csv'
+    output_result_csv = 'grid_loss_results.csv'
     
     print("Loading global NC index table...")
     df_nc_index = pd.read_csv(INDEX_FILE)
-    
     
     set_seed(seed=42)
     
