@@ -54,6 +54,9 @@ class DifferentiableRTM(nn.Module):
         self.t_array = None
         self.eps_array = None
         self.eps_soil_nd = None
+        self.t_eff_wigneron = None
+        self.t_eff_holmes = None
+        self.t_eff_wilheit = None
         
         # 定义默认土壤各层厚度 (m)，通过 register_buffer 自动跟随模型挂载到 GPU
         self.register_buffer('dz_soi', torch.tensor([0.0175, 0.0276, 0.0455, 0.0750, 0.1236, 
@@ -296,14 +299,17 @@ class DifferentiableRTM(nn.Module):
         eps_soil_all = self.diel_soil_Debye_framework(wliq_soi, f.unsqueeze(1),
                                                       znd_pred, zkd_pred, zxmvt_pred, zep0b_pred, ztaub_pred, zsigmab_pred, zep0u_pred, ztauu_pred, zsigmau_pred,)
         t_eff = self.eff_soil_temp_Wilheit(dz_soi, t_soi, eps_soil_all, theta, lam*100)[3]  # Wilheit 模型需要 cm 单位的波长
-        print('np.min(t_eff), np.max(t_eff)',torch.min(t_eff), torch.max(t_eff))
-        print('Wigneron跟wilheit的Bias', (t_eff_wigneron - t_eff).mean().item())
-        print('Wigneron跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_wigneron, t_eff)).item())
-        print('Holmes跟wilheit的Bias', (t_eff_holmes - t_eff).mean().item())
-        print('Holmes跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_holmes, t_eff)).item())
+        # print('np.min(t_eff), np.max(t_eff)',torch.min(t_eff), torch.max(t_eff))
+        # print('Wigneron跟wilheit的Bias', (t_eff_wigneron - t_eff).mean().item())
+        # print('Wigneron跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_wigneron, t_eff)).item())
+        # print('Holmes跟wilheit的Bias', (t_eff_holmes - t_eff).mean().item())
+        # print('Holmes跟wilheit的有效温度RMSE', torch.sqrt(nn.MSELoss()(t_eff_holmes, t_eff)).item())
         
-        pd.DataFrame({'t_eff_wigneron': t_eff_wigneron.cpu().numpy(), 't_eff_wilheit': t_eff.cpu().numpy(), 't_eff_holmes': t_eff_holmes.cpu().numpy()}).\
-        to_csv('t_eff_comparison_wigneron_and_wilheit.csv', index=False)
+        # pd.DataFrame({'t_eff_wigneron': t_eff_wigneron.cpu().numpy(), 't_eff_wilheit': t_eff.cpu().numpy(), 't_eff_holmes': t_eff_holmes.cpu().numpy()}).\
+        # to_csv('t_eff_comparison_wigneron_and_wilheit.csv', index=False)
+        self.t_eff_wigneron = t_eff_wigneron
+        self.t_eff_holmes = t_eff_holmes
+        self.t_eff_wilheit = t_eff
         
         g = torch.sqrt(eps_soil - torch.sin(theta)**2)
         r_s_h = torch.abs((torch.cos(theta) - g)/(torch.cos(theta) + g))**2
@@ -514,8 +520,8 @@ class DifferentiableRTM(nn.Module):
         # C(eps) = ((eps'' / eps') / eps0_param)^b
         eps_ratio = eps_i / eps_r
         C = (eps_ratio / eps0_param) ** b_param
-        # 限制 C 的范围在 [0, 1] 之间，防止极端干燥条件下的非物理外推
-        C = torch.clamp(C, min=0.0, max=1.0)
+        # 限制 C 的范围在 [0.001,+] 之间，防止极端干燥条件下的非物理外推
+        C = torch.clamp(C, min=0.001)
         
         teff = t_deep + (t_surf - t_deep) * C
         return teff
