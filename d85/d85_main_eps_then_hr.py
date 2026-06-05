@@ -169,7 +169,7 @@ class DielectricPredictor(nn.Module):
         super(DielectricPredictor, self).__init__()
         self.embed = nn.Embedding(num_classes, embed_dim)
         self.net = nn.Sequential(
-            nn.Linear(3 + embed_dim, 64), 
+            nn.Linear(6 + embed_dim, 64), 
             nn.LayerNorm(64),
             nn.GELU(), 
             nn.Linear(64, 256),
@@ -283,8 +283,8 @@ def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex
     EPS_REAL_MIN = 2.0
     
     # Extract all predicted real and imaginary parts
-    eps_real = torch.cat([eps_complex_surf.real, eps_complex_all.real.flatten()])
-    eps_imag = torch.cat([eps_complex_surf.imag, eps_complex_all.imag.flatten()])
+    eps_real = torch.cat([eps_complex_surf.real])  # , eps_complex_all.real.flatten()
+    eps_imag = torch.cat([eps_complex_surf.imag])  # , eps_complex_all.imag.flatten()
     
     # 2. Physical boundary constraints
     # --- 保留原有的基础物理边界约束（针对所有层） ---
@@ -426,7 +426,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     surface_porsl = (t_porsl[:, 0]/t_wf_total[:, 0]*w1 + t_porsl[:, 1]/t_wf_total[:, 1]*w2) / wtot
     surface_BD_all = (t_BD_all[:, 0]/t_wf_total[:, 0]*w1 + t_BD_all[:, 1]/t_wf_total[:, 1]*w2) / wtot / 1000
 
-    x_diel_raw_surf = torch.stack([surface_sm, surface_t, surface_clay, ], dim=1) #surface_sand, surface_porsl, surface_BD_all
+    x_diel_raw_surf = torch.stack([surface_sm, surface_t, surface_clay, surface_sand, surface_porsl, surface_BD_all], dim=1) 
     x_diel_norm_surf = (x_diel_raw_surf - x_diel_raw_surf.mean(dim=0)) / (x_diel_raw_surf.std(dim=0) + 1e-8)
 
     # —— 10-layer soil parameters prepared for deep dielectric constant ——
@@ -442,10 +442,10 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     BD_all_all = (t_BD_all / t_wf_total) / 1000.0
     
     # Combine into [N, 10, 6] full-layer inputs
-    x_diel_raw_all = torch.stack([sm_all, t_all, clay_all, ], dim=-1) #sand_all, porsl_all, BD_all_all
+    x_diel_raw_all = torch.stack([sm_all, t_all, clay_all, sand_all, porsl_all, BD_all_all], dim=-1) 
     
     # Flatten to uniformly Normalize and pass into the network: [N*10, 6]
-    x_diel_raw_flat = x_diel_raw_all.view(-1, 3)
+    x_diel_raw_flat = x_diel_raw_all.view(-1, 6)
     x_diel_norm_flat = (x_diel_raw_flat - x_diel_raw_flat.mean(dim=0)) / (x_diel_raw_flat.std(dim=0) + 1e-8)
     
     # Corresponding 10-layer Patchclass tiling: [N*10]
@@ -501,8 +501,8 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         print(f'best_loss: {best_loss:.4f} | best_hr: {best_hr:.4f}')
         # 3. Apply dynamically found bounds
         center_hr = best_hr
-        left_hr = torch.tensor(center_hr, device=device) - 0.5
-        right_hr = torch.tensor(center_hr, device=device) + 0.5
+        left_hr = torch.tensor(center_hr, device=device) - 0.1
+        right_hr = torch.tensor(center_hr, device=device) + 0.1
         hr_pred_init = torch.full((num_samples,), center_hr, device=device)
     # 4. Re-run the RTM once with the network's INITIAL RANDOM eps and the optimal best_hr 
     # to load the computational graphs and RTM internal memory states (like ffrz_array) for Stage 1
@@ -587,7 +587,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
                 tb_h_sim, tb_v_sim, 
                 eps_pred_surf, eps_pred_all,
                 PR_obs, eps_M09_surf_real, 
-                lamda_bound_loss=0, lamda_structure_loss=0,lamda_PR_loss=0
+                lamda_bound_loss=10, lamda_structure_loss=0,lamda_PR_loss=1000
             )
         
         loss.backward()
@@ -608,7 +608,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         else:
             patience_counter += 1
             
-        if epoch % 100 == 0 or epoch == epochs - 1:
+        if epoch % 2000 == 0 or epoch == epochs - 1:
             current_lr = optimizer_diel.param_groups[0]['lr']
             print(f"Stage 1 Epoch {epoch:04d} | Loss: {current_loss:.4f} | RMSE Loss: {current_rmse:.4f} | PR_loss: {PR_loss:.4f} | Best RMSE: {best_loss_stage1:.4f} | LR: {current_lr:.6f} | H Err: {torch.sqrt(criterion(tb_h_sim, obs_tb_h)).item():.4f} | V Err: {torch.sqrt(criterion(tb_v_sim, obs_tb_v)).item():.4f}")
 
@@ -666,7 +666,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
                 tb_h_sim, tb_v_sim, 
                 eps_pred_surf, eps_pred_all,
                 PR_obs, eps_M09_surf_real, 
-                lamda_bound_loss=0, lamda_structure_loss=0, lamda_PR_loss=0
+                lamda_bound_loss=10, lamda_structure_loss=0, lamda_PR_loss=1000
             )
         
         loss.backward()
@@ -811,11 +811,14 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
 
     # 2. Matrix concatenation: directly prepend surf to all to form a [708, 11] matrix
     # The order of each row automatically becomes: surf -> all[0] -> all[1] -> ... -> all[9]
-    combined_real = torch.cat([eps_real_surf.unsqueeze(1), eps_real_all], dim=1)
-    combined_imag = torch.cat([eps_imag_surf.unsqueeze(1), eps_imag_all], dim=1)
-    combined_sm = torch.cat([surface_sm.unsqueeze(1), sm_all], dim=1)
-    combined_t = torch.cat([surface_t.unsqueeze(1), t_all], dim=1)
-    combined_clay = torch.cat([surface_clay.unsqueeze(1), clay_all], dim=1)
+    combined_real = torch.cat([eps_real_surf.unsqueeze(1)], dim=1) #, eps_real_all
+    combined_imag = torch.cat([eps_imag_surf.unsqueeze(1)], dim=1) # , eps_imag_all
+    combined_sm = torch.cat([surface_sm.unsqueeze(1)], dim=1) # , sm_all
+    combined_t = torch.cat([surface_t.unsqueeze(1)], dim=1)  # , t_all
+    combined_clay = torch.cat([surface_clay.unsqueeze(1)], dim=1) # , clay_all
+    combined_sand = torch.cat([surface_sand.unsqueeze(1)], dim=1) # , sand_all
+    combined_porsl = torch.cat([surface_porsl.unsqueeze(1)], dim=1) # , porsl_all
+    combined_BD_all = torch.cat([surface_BD_all.unsqueeze(1)], dim=1) # , BD_all_all
 
     # 3. Flatten by row and export
     df = pd.DataFrame(
@@ -825,6 +828,9 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
             "soil_moisture": combined_sm.flatten().cpu().numpy(),
             "temperature": combined_t.flatten().cpu().numpy(),
             "clay_fraction": combined_clay.flatten().cpu().numpy(),
+            "sand_fraction": combined_sand.flatten().cpu().numpy(),
+            "porosity": combined_porsl.flatten().cpu().numpy(),
+            "bulk_density": combined_BD_all.flatten().cpu().numpy(),
         }
     ).to_csv(os.path.join(output_dir, f"lat_{ease_lat}_lon_{ease_lon}_soil_dielectric_data_11layers.csv"),
               index=False, float_format="%.6f")
@@ -855,7 +861,7 @@ if __name__ == "__main__":
             writer.writerow(['target_csv', 'best_loss'])
 
     for grid_id in range(len(csv_files)):
-        # try:
+        try:
             target_csv = csv_files[grid_id]
             ease_lat, ease_lon = map(float, os.path.basename(target_csv).split('_')[1:4:2])
             print(f"Processing grid file: {target_csv} (Longitude: {ease_lon}, Latitude: {ease_lat})")
@@ -867,9 +873,9 @@ if __name__ == "__main__":
                 writer = csv.writer(f)
                 writer.writerow([target_csv, best_loss])
             
-            break
-        # except:
-        #     print(f'Error in {target_csv}\n')
+            # break
+        except:
+            print(f'Error in {target_csv}\n')
         #     break
         
         
