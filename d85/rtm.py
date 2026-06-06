@@ -288,12 +288,16 @@ class DifferentiableRTM(nn.Module):
         
         eps_soil = torch.where(is_desert, eps_soil_d, eps_soil_nd)
         
-        # 利用 Lv 模型计算多层有效温度，此处将 10 层的 pred 矩阵完整传入
-        # 
         # 利用 Lv 模型计算多层有效温度，传入 10 层介电常数预测结果
-        t_eff = self.eff_soil_temp_Lv(dz_soi, t_soi, wliq_soi, f, lam, wf_clay,
-                                      eps_pred_all)
-                                      
+        # t_eff = self.eff_soil_temp_Lv(dz_soi, t_soi, wliq_soi, f, lam, wf_clay,
+        #                               eps_pred_all)                      
+        # --- 使用 Holmes 2006 两层模型计算有效温度 ---
+        # 注意：此处必须加上 self.tfrz 转化为开尔文 (Kelvin)，以保证与后续亮温物理量纲一致
+        t_eff_val = self.eff_soil_temp_Holmes2006(
+            liq_surf, eps_soil, t_surf + self.tfrz, t_deep + self.tfrz
+        )
+        # 堆叠极化维度，保持原来的 [2, Batch] 张量结构，与后续代码无缝衔接
+        t_eff = torch.stack([t_eff_val, t_eff_val])                
         self.t_eff = t_eff
         
         g = torch.sqrt(eps_soil - torch.sin(theta)**2)
@@ -314,6 +318,29 @@ class DifferentiableRTM(nn.Module):
         self.tb_soil = tb_soil
             
         return r_r, tb_soil
+    
+    
+    def eff_soil_temp_Holmes2006(self, wc_surf, eps_surf, t_surf, t_deep, return_C=False):
+        """
+        Holmes 2006 model (基于介电常数比值的参数化)
+        eps_surf: 表层复介电常数 (complex)
+        """
+        eps_r = eps_surf.real
+        eps_i = torch.abs(eps_surf.imag)
+        
+        # 2003-2004 interannual calibration parameters
+        b_param = 0.87      # 0.87
+        eps0_param = 0.08
+
+        # C(eps) = ((eps'' / eps') / eps0_param)^b
+        eps_ratio = eps_i / eps_r
+        C = (eps_ratio / eps0_param) ** b_param
+        C = torch.clamp(C, min=0.001)
+        
+        teff = t_deep + (t_surf - t_deep) * C
+        if return_C:
+            return teff, C
+        return teff
     
     def eff_soil_temp_Lv(self, dz_soi, t_soi, wc_soi, f, lam, wf_clay,
                          eps_pred_all):
