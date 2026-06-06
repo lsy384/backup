@@ -290,14 +290,17 @@ def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex
     # --- 保留原有的基础物理边界约束（针对所有层） ---
     bound_loss_general = torch.mean(torch.relu(EPS_REAL_MIN - eps_real)) + torch.mean(torch.relu(-eps_imag))
     
+    # === 新增：限制虚部/实部的比值 (即 eps_imag <= 1.05 * eps_real) ===
+    ratio_loss = torch.mean(torch.relu(eps_imag - 1.05 * eps_real))
+    
     # --- 新增：仅针对表层实部的 M09 ±50% 约束 ---
     lower_bound_surf = 0.5 * eps_M09_surf_real
     upper_bound_surf = 1.5 * eps_M09_surf_real
     bound_loss_surf = torch.mean(torch.relu(lower_bound_surf - eps_complex_surf.real)) + \
                       torch.mean(torch.relu(eps_complex_surf.real - upper_bound_surf))
                       
-    # 合并边界约束 Loss
-    bound_loss = bound_loss_general + bound_loss_surf
+    # 合并边界约束 Loss (将 ratio_loss 加入总 bound_loss 中)
+    bound_loss = bound_loss_general + bound_loss_surf + ratio_loss
     
     # 3. Synergistic physical envelope constraint (L-band)
     lower_bound = 0.05 * (eps_real - EPS_REAL_MIN)
@@ -734,6 +737,10 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         t_eff_array = rtm_model.t_eff[0]
         r_s_h, r_s_v = rtm_model.r_s[0], rtm_model.r_s[1]
         r_r_h, r_r_v = rtm_model.r_r[0], rtm_model.r_r[1]
+        # 新增：提取三个不同模型的温度计算结果
+        t_eff_wilheit_v = rtm_model.t_eff_wilheit[1]
+        t_eff_holmes = rtm_model.t_eff_holmes[0]
+        t_eff_wigneron = rtm_model.t_eff_wigneron[0]
 
     obs_tb_h_exp = np.repeat(obs['tb_h'], patch_dim)
     obs_tb_v_exp = np.repeat(obs['tb_v'], patch_dim)
@@ -794,7 +801,11 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         "surface_BD_all": surface_BD_all.cpu().numpy(),
         "forc_topo": t_forc_topo.cpu().numpy(),
         "ffrz": ffrz_array.cpu().numpy(),
-        "t_eff_array": t_eff_array.cpu().numpy(),
+        # === 修改与新增有效温度列 ===
+        "t_eff_array": t_eff_array.cpu().numpy(),        # 默认保存的也是 Wilheit H极化
+        "t_eff_wilheit_v": t_eff_wilheit_v.cpu().numpy(),
+        "t_eff_holmes": t_eff_holmes.cpu().numpy(),
+        "t_eff_wigneron": t_eff_wigneron.cpu().numpy(),
         "r_s_h": r_s_h.cpu().numpy(),
         "r_s_v": r_s_v.cpu().numpy(),
         "r_r_h": r_r_h.cpu().numpy(),
@@ -835,6 +846,26 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     ).to_csv(os.path.join(output_dir, f"lat_{ease_lat}_lon_{ease_lon}_soil_dielectric_data_11layers.csv"),
               index=False, float_format="%.6f")
     print('Dielectric constant related data has been outputted.\n')
+    arr_base = t_eff_array.cpu().numpy() if hasattr(t_eff_array, "cpu") else t_eff_array
+    # 计算 RMSE 的闭包函数
+    def calc_rmse(arr1, arr2):
+        # 如果是 PyTorch Tensor，先脱离计算图、移到 CPU 并转为 numpy
+        if hasattr(arr1, "detach"):
+            arr1 = arr1.detach().cpu().numpy()
+        if hasattr(arr2, "detach"):
+            arr2 = arr2.detach().cpu().numpy()
+        return np.sqrt(np.mean((arr1 - arr2) ** 2))
+    # 提取用于构建 DataFrame 的一维数组并计算 RMSE
+    arr_base = t_eff_array.cpu().numpy() if hasattr(t_eff_array, "cpu") else t_eff_array
+    rmse_wilheit_v = calc_rmse(t_eff_wilheit_v, arr_base)
+    rmse_holmes = calc_rmse(t_eff_holmes, arr_base)
+    rmse_wigneron = calc_rmse(t_eff_wigneron, arr_base)
+    print("================================================================")
+    print("📊 Effective Temperature (T_eff) Comparison RMSE Results:")
+    print(f"  -> RMSE(t_eff_wilheit_v vs t_eff_array): {rmse_wilheit_v:.4f} K")
+    print(f"  -> RMSE(t_eff_holmes    vs t_eff_array): {rmse_holmes:.4f} K")
+    print(f"  -> RMSE(t_eff_wigneron  vs t_eff_array): {rmse_wigneron:.4f} K")
+    print("================================================================")
     
     return best_loss_stage2
 
@@ -845,7 +876,7 @@ if __name__ == "__main__":
     patch_map_file = '/home/liusy/storage_global_veg_wigneron/patch_map_EASE_open_lands.csv' 
     nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
     output_dir = "/home/liusy/storage_global_veg_wigneron/tb_calibrate_try_1"
-    csv_files = open('csv_files_list_for_training.csv', encoding='utf-8').read().splitlines()
+    csv_files = open('csv_files_list_for_training.csv', encoding='utf-8').read().splitlines()[:10]
     # 定义输出结果文件
     output_result_csv = 'grid_loss_results.csv'
     
@@ -861,7 +892,7 @@ if __name__ == "__main__":
             writer.writerow(['target_csv', 'best_loss'])
 
     for grid_id in range(len(csv_files)):
-        try:
+        # try:
             target_csv = csv_files[grid_id]
             ease_lat, ease_lon = map(float, os.path.basename(target_csv).split('_')[1:4:2])
             print(f"Processing grid file: {target_csv} (Longitude: {ease_lon}, Latitude: {ease_lat})")
@@ -874,8 +905,9 @@ if __name__ == "__main__":
                 writer.writerow([target_csv, best_loss])
             
             # break
-        except:
-            print(f'Error in {target_csv}\n')
-        #     break
+        # except:
+        #     print(f'Error in {target_csv}\n')
+        #     continue
+           
         
         
