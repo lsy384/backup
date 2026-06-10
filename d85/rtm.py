@@ -55,6 +55,7 @@ class DifferentiableRTM(nn.Module):
         self.eps_soil_nd_M09 = None
         self.eps_soil_nd_M09_all = None
         self.eps_soil_nd_D85 = None
+        self.eps_soil_after_frz_and_desert = None
      
         
         # 定义默认土壤各层厚度 (m)，通过 register_buffer 自动跟随模型挂载到 GPU
@@ -105,7 +106,8 @@ class DifferentiableRTM(nn.Module):
                 wf_clay, wf_sand, wf_silt, BD_all, porsl, 
                 sat_theta, sat_fghz,
                 eps_pred_surf, eps_pred_all,
-                hr_pred
+                hr_pred,
+                calc_all_teff=False  # 🌟 新增开关参数，默认为 False
                 ):
         """
         前向传播函数 - 全 GPU 向量化执行
@@ -175,7 +177,8 @@ class DifferentiableRTM(nn.Module):
              wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, 
              theta, fghz, f, omega, kcm, kr, lam, self.rgh_surf,
              eps_pred_surf, eps_pred_all, 
-             hr_pred, dz_soi_batch, t_soi, h2osoi, wf_clay)
+             hr_pred, dz_soi_batch, t_soi, h2osoi, wf_clay,
+             calc_all_teff) # 🌟 传入开关
         
         #############################################################################
         # 5. 植被与积雪模块 (Vegetation and snow module)
@@ -250,7 +253,7 @@ class DifferentiableRTM(nn.Module):
              wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, 
              theta, fghz, f, omega, kcm, kr, lam, rgh_surf,
              eps_pred_surf, eps_pred_all, hr_pred,
-             dz_soi, t_soi, wliq_soi, wf_clay):
+             dz_soi, t_soi, wliq_soi, wf_clay, calc_all_teff=False): # 🌟 增加参数
         
         is_desert = (liq_surf < 0.02) & (wf_sand_surf > 90)
         ffrz = torch.where((liq_surf + ice_surf) <= 0.0, 
@@ -285,39 +288,48 @@ class DifferentiableRTM(nn.Module):
         eps_soil_d_imag = (2.79 - 2.53)*(fghz/0.27)/(1 + (fghz/0.27)**2) + 0.002
         eps_soil_d = torch.complex(eps_soil_d_real, eps_soil_d_imag)
         
-        
         eps_soil = torch.where(is_desert, eps_soil_d, eps_soil_nd)
+        
         
         # 利用 Lv 模型计算多层有效温度，传入 10 层介电常数预测结果
         # t_eff = self.eff_soil_temp_Lv(dz_soi, t_soi, wliq_soi, f, lam, wf_clay,
         #                               eps_pred_all)   
                            
         # --- 统一计算三种方案的有效温度并存入类属性 ---
-        
-        # 1. Wilheit 1978 方案（支持微分、无原位操作版本）
-        eps_pred_all_mod = torch.where(is_desert.unsqueeze(1), 
-                                       eps_soil_d.unsqueeze(1).expand_as(eps_pred_all), 
-                                       eps_pred_all)
-        r_s_h, r_s_v, teff_h_wilheit, teff_v_wilheit = self.eff_soil_temp_Wilheit(
-            dz_soi, t_soi, eps_pred_all_mod, theta, lam * 100.0
-        )
-        self.t_eff_wilheit = torch.stack([teff_h_wilheit, teff_v_wilheit])
-        
-        # 2. Holmes 2006 方案
         teff_holmes_val = self.eff_soil_temp_Holmes2006(
-            liq_surf, eps_soil, t_surf + self.tfrz, t_deep + self.tfrz
-        )
+                eps_soil, t_surf + self.tfrz, t_deep + self.tfrz
+            )
         self.t_eff_holmes = torch.stack([teff_holmes_val, teff_holmes_val])
-        
-        # 3. Wigneron 2001 方案
-        teff_wigneron_val = self.eff_soil_temp_Wigneron2001(
-            liq_surf, t_surf + self.tfrz, t_deep + self.tfrz
-        )
-        self.t_eff_wigneron = torch.stack([teff_wigneron_val, teff_wigneron_val])
-        
-        # 后续亮温计算统一采用 Wilheit 方案的有效温度和反射率
-        t_eff = self.t_eff_wigneron
+        t_eff = self.t_eff_holmes
         self.t_eff = t_eff
+
+        # 🌟 只有在 calc_all_teff 为 True 时（即最后一次输出数据时），才进行耗时的 Wilheit 和 Holmes 计算
+        if calc_all_teff:
+            self.eps_soil_after_frz_and_desert = eps_soil
+            # 1. Wilheit 1978 方案
+            eps_pred_all_mod = torch.where(is_desert.unsqueeze(1), 
+                                           eps_soil_d.unsqueeze(1).expand_as(eps_pred_all), 
+                                           eps_pred_all)
+            r_s_h, r_s_v, teff_h_wilheit, teff_v_wilheit = self.eff_soil_temp_Wilheit(
+                dz_soi, t_soi, eps_pred_all_mod, theta, lam * 100.0
+            )
+            self.t_eff_wilheit = torch.stack([teff_h_wilheit, teff_v_wilheit])
+            
+            # 2. Holmes 2006 方案
+            # teff_holmes_val = self.eff_soil_temp_Holmes2006(
+            #      eps_soil, t_surf + self.tfrz, t_deep + self.tfrz
+            # )
+            # self.t_eff_holmes = torch.stack([teff_holmes_val, teff_holmes_val])
+            # 3. Wigneron 2001 方案 
+            teff_wigneron_val = self.eff_soil_temp_Wigneron2001(
+            liq_surf, t_surf + self.tfrz, t_deep + self.tfrz
+            )
+            self.t_eff_wigneron = torch.stack([teff_wigneron_val, teff_wigneron_val])
+        else:
+            # 训练期间设为 None，节省显存
+            self.t_eff_wilheit = None
+            self.t_eff_holmes = None
+        
         
         g = torch.sqrt(eps_soil - torch.sin(theta)**2)
         r_s_h = torch.abs((torch.cos(theta) - g)/(torch.cos(theta) + g))**2
@@ -340,29 +352,35 @@ class DifferentiableRTM(nn.Module):
     
     def eff_soil_temp_Wilheit(self, dz_soi, t_soi, eps, theta, lamcm):
         """
-        Calculate effective soil temperature using Wilheit 1978 coherent model.
-        (Differentiable & NaN-Safe version)
+        修正后的 Wilheit 1978 相干模型。
+        在张量化操作中严格复现了 Fortran 物理衰减截断 (NMAX) 的逻辑，避免数值爆炸。
         """
         batch_size = eps.shape[0]
         nlay = eps.shape[1]
         N = nlay + 1
         device = eps.device
 
-        # 1. Calculate index of refraction & Layer depth
-        CN_0 = torch.ones((batch_size, 1), dtype=torch.complex64, device=device)
-        CN_rest = torch.sqrt(eps)
-        CN = torch.cat([CN_0, CN_rest], dim=1)
+        # --- 数据精度建议 ---
+        # 注: Fortran原版使用了 JPRB (通常是float64/complex128)。如果复现精度要求高，
+        # 建议将 dtype 提升为 torch.complex128 和 torch.float64。
+        dtype_c = torch.complex64 
+        dtype_f = torch.float32
 
-        DEL_0 = torch.zeros((batch_size, 1), device=device)
-        DEL_rest = dz_soi * 100.0
-        DEL = torch.cat([DEL_0, DEL_rest], dim=1)
+        # 1. 计算折射率 (大气层折射率为 1.0)
+        CN = torch.zeros((batch_size, N), dtype=dtype_c, device=device)
+        CN[:, 0] = 1.0 + 0.0j
+        CN[:, 1:] = torch.sqrt(eps)
 
-        # 2. Calculate squares of interface propagators (CP)
+        DEL = torch.zeros((batch_size, N), dtype=dtype_f, device=device)
+        DEL[:, 1:] = dz_soi * 100.0  # 假设 dz_soi 是米，转为 cm [cite: 27]
+
+        # 2. 计算界面传播矩阵 (CP) 及其动态截断点 NMAX
         S = torch.sin(theta)
-        CP_list = [torch.zeros(batch_size, dtype=torch.complex64, device=device) for _ in range(N)]
-        CP_list[0] = torch.ones(batch_size, dtype=torch.complex64, device=device)
+        CP = torch.ones((batch_size, N), dtype=dtype_c, device=device)
         
-        propagation_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        # NMAX_idx 用于追踪每个 batch 样本的电磁波有效穿透层
+        NMAX_idx = torch.full((batch_size,), N-1, dtype=torch.long, device=device)
+        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
 
         for i in range(1, N-1):
             CS = CN[:, 0] * S / CN[:, i]
@@ -370,126 +388,128 @@ class DifferentiableRTM(nn.Module):
             ARG = DEL[:, i] * 2.0 * self.pi / lamcm
             CARG = 2.0 * ARG * CN[:, i] * CC * 1.0j
             
-            CP_next = torch.exp(CARG) * CP_list[i-1]
-            CP_list[i] = torch.where(propagation_mask, CP_next, torch.zeros_like(CP_next))
+            CP_next = torch.exp(CARG) * CP[:, i-1]
+            CP[:, i] = torch.where(active_mask, CP_next, CP[:, i-1])
             
-            propagation_mask = propagation_mask & (torch.abs(CP_list[i]) >= 0.0001)
+            # 严格对齐 Fortran: IF (ABS(CP(I)) < 0.0001) EXIT
+            below_thresh = torch.abs(CP[:, i]) < 0.0001
+            crossed_now = active_mask & below_thresh
+            
+            # 记录刚刚穿过阈值的层索引
+            NMAX_idx = torch.where(crossed_now, torch.tensor(i + 1, device=device), NMAX_idx)
+            active_mask = active_mask & (~below_thresh)
 
-        CP = torch.stack(CP_list, dim=1)
+        # 3. 逆向计算电场 (Backward loop)
+        CEP_h = torch.zeros((batch_size, N), dtype=dtype_c, device=device)
+        CEM_h = torch.zeros((batch_size, N), dtype=dtype_c, device=device)
+        CEP_v = torch.zeros((batch_size, N), dtype=dtype_c, device=device)
+        CEM_v = torch.zeros((batch_size, N), dtype=dtype_c, device=device)
 
-        # 3. Calculate electric fields within each layer (Backward loop)
-        CEP_h_list = [torch.zeros(batch_size, dtype=torch.complex64, device=device) for _ in range(N)]
-        CEM_h_list = [torch.zeros(batch_size, dtype=torch.complex64, device=device) for _ in range(N)]
-        CEP_v_list = [torch.zeros(batch_size, dtype=torch.complex64, device=device) for _ in range(N)]
-        CEM_v_list = [torch.zeros(batch_size, dtype=torch.complex64, device=device) for _ in range(N)]
-        
-        CEP_h_list[N-1] = torch.ones(batch_size, dtype=torch.complex64, device=device)
-        CEP_v_list[N-1] = torch.ones(batch_size, dtype=torch.complex64, device=device)
+        # Fortran: 仅在 NMAX 处初始化边界条件为 (1, 0)
+        batch_indices = torch.arange(batch_size, device=device)
+        CEP_h[batch_indices, NMAX_idx] = 1.0 + 0.0j
+        CEP_v[batch_indices, NMAX_idx] = 1.0 + 0.0j
 
-        for ii in range(2, N + 1):
-            j = N - ii
+        # 逆向传播，从最大可能层往回算
+        for j in range(N-2, -1, -1):
+            active_j = j < NMAX_idx  # 只计算处于有效穿透深度的物理层
+            
+            # 为无效层提供一个安全的除数兜底，防止 PyTorch 后台报错，但这部分数据会被屏蔽
+            safe_cp = torch.where(active_j, CP[:, j], torch.tensor(1.0, dtype=dtype_c, device=device))
+
             CSJ = CN[:, 0] * S / CN[:, j]
             CCJ = torch.sqrt(1.0 + 0.0j - CSJ*CSJ)
             CSJP1 = CN[:, 0] * S / CN[:, j+1]
             CCJP1 = torch.sqrt(1.0 + 0.0j - CSJP1*CSJP1)
 
-            cp_abs = torch.abs(CP[:, j])
-            safe_cp = torch.where(cp_abs < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CP[:, j])
-
-            # --- HPLD (Horizontal) Equations (NaN防爆处理) ---
+            # --- 水平极化 (HPLD) ---
             CA_h = 2.0 * CN[:, j] * CCJ / (CN[:, j]*CCJ + CN[:, j+1]*CCJP1)
-            safe_CA_h = torch.where(torch.abs(CA_h) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CA_h)
-            
             CB_h = (CN[:, j]*CCJ - CN[:, j+1]*CCJP1) / ((CN[:, j]*CCJ + CN[:, j+1]*CCJP1) * safe_cp)
-
-            CEP_h_next = CEP_h_list[j+1]
-            CEM_h_next = CEM_h_list[j+1]
             
-            CEP_h_j = CEP_h_next/safe_CA_h + CB_h*CEM_h_next/safe_CA_h
-            CEM_h_j = CEM_h_next + (CEP_h_next - CEP_h_j)*CP[:, j]
+            CEP_h_j = CEP_h[:, j+1]/CA_h + CB_h*CEM_h[:, j+1]/CA_h
+            CEM_h_j = CEM_h[:, j+1] + (CEP_h[:, j+1] - CEP_h_j)*safe_cp
 
-            # --- VPLD (Vertical) Equations (NaN防爆处理) ---
+            # 利用 active_j 门控：如果是无效层，保持电场为 0
+            CEP_h[:, j] = torch.where(active_j, CEP_h_j, CEP_h[:, j])
+            CEM_h[:, j] = torch.where(active_j, CEM_h_j, CEM_h[:, j])
+
+            # --- 垂直极化 (VPLD) ---
             CD_v = 2.0 * CN[:, j] * CCJ
-            safe_CD_v = torch.where(torch.abs(CD_v) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CD_v)
-            
             CA_v = CN[:, j]*CCJP1 + CN[:, j+1]*CCJ
             CB_v = CN[:, j]*CCJP1 - CN[:, j+1]*CCJ
             
-            CEP_v_next = CEP_v_list[j+1]
-            CEM_v_next = CEM_v_list[j+1]
-            
-            CEP_v_j = CA_v*CEP_v_next/safe_CD_v + CB_v*CEM_v_next/(safe_CD_v*safe_cp)
+            CEP_v_j = CA_v*CEP_v[:, j+1]/CD_v + CB_v*CEM_v[:, j+1]/(CD_v*safe_cp)
             CR_v = CN[:, j+1] / CN[:, j]
-            CEM_v_j = CR_v*CEM_v_next + (CEP_v_j - CEP_v_next*CR_v)*CP[:, j]
+            CEM_v_j = CR_v*CEM_v[:, j+1] + (CEP_v_j - CEP_v[:, j+1]*CR_v)*safe_cp
             
-            CEP_h_list[j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEP_h_j), CEP_h_j)
-            CEM_h_list[j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEM_h_j), CEM_h_j)
-            CEP_v_list[j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEP_v_j), CEP_v_j)
-            CEM_v_list[j] = torch.where(cp_abs < 1e-12, torch.zeros_like(CEM_v_j), CEM_v_j)
+            CEP_v[:, j] = torch.where(active_j, CEP_v_j, CEP_v[:, j])
+            CEM_v[:, j] = torch.where(active_j, CEM_v_j, CEM_v[:, j])
 
-        CEP_h = torch.stack(CEP_h_list, dim=1)
-        CEM_h = torch.stack(CEM_h_list, dim=1)
-        CEP_v = torch.stack(CEP_v_list, dim=1)
-        CEM_v = torch.stack(CEM_v_list, dim=1)
-
-        CX_h_stable = torch.where(torch.abs(CEP_h[:, 0:1]) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CEP_h[:, 0:1])
-        CX_v_stable = torch.where(torch.abs(CEP_v[:, 0:1]) < 1e-12, torch.tensor(1e-12, dtype=torch.complex64, device=device), CEP_v[:, 0:1])
+        # 归一化电场
+        CX_h = CEP_h[:, 0]
+        CX_v = CEP_v[:, 0]
+        safe_CX_h = torch.where(torch.abs(CX_h) > 0, CX_h, torch.tensor(1.0, dtype=dtype_c, device=device))
+        safe_CX_v = torch.where(torch.abs(CX_v) > 0, CX_v, torch.tensor(1.0, dtype=dtype_c, device=device))
         
-        CEP_h = CEP_h / CX_h_stable
-        CEM_h = CEM_h / CX_h_stable
-        CEP_v = CEP_v / CX_v_stable
-        CEM_v = CEM_v / CX_v_stable
+        for j in range(N):
+            CEP_h[:, j] = CEP_h[:, j] / safe_CX_h
+            CEM_h[:, j] = CEM_h[:, j] / safe_CX_h
+            CEP_v[:, j] = CEP_v[:, j] / safe_CX_v
+            CEM_v[:, j] = CEM_v[:, j] / safe_CX_v
 
-        # 4. Calculate layer absorption fractions (fa_h and fa_v)
-        fa_h_list = [torch.zeros(batch_size, device=device) for _ in range(nlay)]
-        fa_v_list = [torch.zeros(batch_size, device=device) for _ in range(nlay)]
+        # 4. 计算各层吸收率 (fa)
+        fa_h = torch.zeros((batch_size, nlay), dtype=dtype_f, device=device)
+        fa_v = torch.zeros((batch_size, nlay), dtype=dtype_f, device=device)
         cos_theta = torch.cos(theta)
 
-        for ii in range(1, N):
-            j = N - ii
+        # 严格对齐 Fortran: 对于 NMAX 及以下的层，将 CP 重置为极小虚数 
+        j_indices = torch.arange(N, device=device).unsqueeze(0)
+        mask_nmax = j_indices >= NMAX_idx.unsqueeze(1)
+        CP = torch.where(mask_nmax, torch.tensor(1e-15j, dtype=dtype_c, device=device), CP)
+
+        for j in range(1, N):
+            active_j = j <= NMAX_idx  # 吸收率依然受 NMAX 截断控制
+            
             CS = S / CN[:, j]
             CC = torch.sqrt(1.0 + 0.0j - CS*CS)
             
             R = torch.abs(CP[:, j])
             S_abs = torch.abs(CP[:, j-1])
-            valid_layer = (R > 1e-12) & (S_abs > 1e-12)
             
-            # --- 核心修复：防止 R 或 S_abs 为 0 导致 1.0/0 产生 Inf 和 NaN ---
-            safe_R = torch.clamp(R, min=1e-12)
-            safe_S_abs = torch.clamp(S_abs, min=1e-12)
-            
-            # HPLD Absorption
-            E2_h = (S_abs - R) * torch.abs(CEP_h[:, j])**2 + (1.0/safe_R - 1.0/safe_S_abs) * torch.abs(CEM_h[:, j])**2
+            # 数值保护，因为有倒数项
+            safe_R = torch.where(R > 1e-25, R, torch.tensor(1e-25, device=device))
+            safe_S = torch.where(S_abs > 1e-25, S_abs, torch.tensor(1e-25, device=device))
+
+            # --- HPLD 吸收 ---
+            E2_h = (safe_S - safe_R) * torch.abs(CEP_h[:, j])**2 + (1.0/safe_R - 1.0/safe_S) * torch.abs(CEM_h[:, j])**2
             DP_h = E2_h * (CN[:, j]*CC).real / cos_theta
             CXP_h = CEP_h[:, j] * torch.conj(CEM_h[:, j])
-            X_h = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_h * CP[:, j-1]/safe_S_abs).imag - (CXP_h * CP[:, j]/safe_R).imag )
-            fa_h_list[j-1] = torch.where(valid_layer, DP_h - X_h, torch.tensor(0.0, device=device))
+            X_h = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_h * CP[:, j-1]/safe_S).imag - (CXP_h * CP[:, j]/safe_R).imag )
             
-            # VPLD Absorption
-            E2_v = (S_abs - R) * torch.abs(CEP_v[:, j])**2 + (1.0/safe_R - 1.0/safe_S_abs) * torch.abs(CEM_v[:, j])**2
+            fa_h_val = DP_h - X_h
+            fa_h[:, j-1] = torch.where(active_j, fa_h_val.real, torch.zeros_like(fa_h_val.real))
+            
+            # --- VPLD 吸收 ---
+            E2_v = (safe_S - safe_R) * torch.abs(CEP_v[:, j])**2 + (1.0/safe_R - 1.0/safe_S) * torch.abs(CEM_v[:, j])**2
             DP_v = E2_v * (CN[:, j]*CC).real / cos_theta
             CXP_v = CEP_v[:, j] * torch.conj(CEM_v[:, j])
-            X_v = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_v * CP[:, j-1]/safe_S_abs).imag - (CXP_v * CP[:, j]/safe_R).imag )
-            fa_v_list[j-1] = torch.where(valid_layer, DP_v - X_v, torch.tensor(0.0, device=device))
+            X_v = 2.0 * ((CN[:, j]*CC / cos_theta).imag) * ( (CXP_v * CP[:, j-1]/safe_S).imag - (CXP_v * CP[:, j]/safe_R).imag )
+            
+            fa_v_val = DP_v - X_v
+            fa_v[:, j-1] = torch.where(active_j, fa_v_val.real, torch.zeros_like(fa_v_val.real))
 
-        fa_h = torch.stack(fa_h_list, dim=1)
-        fa_v = torch.stack(fa_v_list, dim=1)
-
-        # Cleanup numeric instabilities
-        fa_h = torch.where(torch.isnan(fa_h) | torch.isinf(fa_h) | (fa_h < 0), torch.tensor(0.0, device=device), fa_h)
-        fa_v = torch.where(torch.isnan(fa_v) | torch.isinf(fa_v) | (fa_v < 0), torch.tensor(0.0, device=device), fa_v)
-
-        # 5. Compute effective soil temperature and reflectivity
+        # 5. 计算有效温度和表面反射率
         sum_fa_h = torch.sum(fa_h, dim=1)
-        teff_h = torch.where(sum_fa_h == 0, t_soi[:, 0], torch.sum(fa_h * t_soi, dim=1) / torch.where(sum_fa_h == 0, torch.tensor(1.0, device=device), sum_fa_h))
+        teff_h = torch.where(sum_fa_h == 0, t_soi[:, 0], torch.sum(fa_h * t_soi, dim=1) / sum_fa_h)
         
         sum_fa_v = torch.sum(fa_v, dim=1)
-        teff_v = torch.where(sum_fa_v == 0, t_soi[:, 0], torch.sum(fa_v * t_soi, dim=1) / torch.where(sum_fa_v == 0, torch.tensor(1.0, device=device), sum_fa_v))
+        teff_v = torch.where(sum_fa_v == 0, t_soi[:, 0], torch.sum(fa_v * t_soi, dim=1) / sum_fa_v)
 
+        # r_s(1) = real(cp(1)) 中的 R = ABS(CEM(1))**2. * REAL(CN(1)) [cite: 46]
         r_h = torch.abs(CEM_h[:, 0])**2 * CN[:, 0].real
         r_v = torch.abs(CEM_v[:, 0])**2 * CN[:, 0].real
         
-        return r_h, r_v, teff_h, teff_v
+        return r_h, r_v, teff_h, teff_v, fa_h, fa_v
     
     
     def eff_soil_temp_Wigneron2001(self, wc_surf, t_surf, t_deep):
@@ -498,13 +518,15 @@ class DifferentiableRTM(nn.Module):
         """
         w0 = 0.30
         bw = 0.30
-        C = torch.clamp((wc_surf / w0)**bw, min=0.001)
-        C = torch.where(wc_surf < 0.0, torch.full_like(C, 0.001), C)
+        
+        # 🌟 防爆修复 3：在除以 w0 和求 bw 次幂之前，严格限制 wc_surf 为正数
+        wc_safe = torch.clamp(wc_surf, min=1e-6)
+        C = torch.clamp((wc_safe / w0)**bw, min=0.001)
         teff = t_deep + (t_surf - t_deep) * C
         return teff
     
     
-    def eff_soil_temp_Holmes2006(self, wc_surf, eps_surf, t_surf, t_deep, return_C=False):
+    def eff_soil_temp_Holmes2006(self,  eps_surf, t_surf, t_deep, return_C=False):
         """
         Holmes 2006 model (基于介电常数比值的参数化)
         eps_surf: 表层复介电常数 (complex)
@@ -513,7 +535,7 @@ class DifferentiableRTM(nn.Module):
         eps_i = torch.abs(eps_surf.imag)
         
         # 2003-2004 interannual calibration parameters
-        b_param = 0.87      # 0.87
+        b_param = 0.05      # 0.87
         eps0_param = 0.08
 
         # C(eps) = ((eps'' / eps') / eps0_param)^b
@@ -683,20 +705,28 @@ class DifferentiableRTM(nn.Module):
         wc = torch.clamp(swc, min=0.001)
         alphas = 0.65
         eps_s = (1.01 + 0.44 * self.rho_soil)**2.0 - 0.062                      
-        # 如果传入了神经网络预测的 beta'，则使用预测值；否则使用原经验公式
         if beta_pred is not None:
             beta = beta_pred
         else:
             beta = (127.48 - 0.519 * wf_sand - 0.152 * wf_clay) / 100.0             
-        eaa = 1.0 + (BD_all / self.rho_soil) * (eps_s**alphas - 1.0) + (wc**beta) * (ew.real**alphas) - wc 
-        epsr = eaa ** (1.0/alphas)                                              
-        # 如果传入了神经网络预测的 beta''，则使用预测值；否则使用原经验公式
+        
+        # 🌟 防爆修复 1：ew.real 和 eaa 求 0.65 次幂前，确保严格大于 0
+        ew_real_safe = torch.clamp(ew.real, min=1e-6)
+        eaa = 1.0 + (BD_all / self.rho_soil) * (eps_s**alphas - 1.0) + (wc**beta) * (ew_real_safe**alphas) - wc 
+        eaa_safe = torch.clamp(eaa, min=1e-6)
+        epsr = eaa_safe ** (1.0/alphas)                                              
+        
         if beta_i_pred is not None:
             beta_i = beta_i_pred
         else:
             beta_i = (133.797 - 0.603 * wf_sand - 0.166 * wf_clay) / 100.0          
-        eaa_i = (wc**beta_i) * (torch.abs(ew.imag)**alphas)                     
-        epsi = eaa_i ** (1.0/alphas)                                            
+        
+        # 🌟 防爆修复 2：ew.imag 的绝对值可能为 0，求 0.65 次方时反向传播梯度会无穷大
+        ew_imag_safe = torch.clamp(torch.abs(ew.imag), min=1e-6)
+        eaa_i = (wc**beta_i) * (ew_imag_safe**alphas)                     
+        eaa_i_safe = torch.clamp(eaa_i, min=1e-6)
+        epsi = eaa_i_safe ** (1.0/alphas)                                            
+        
         return torch.complex(epsr, epsi)
     
     
