@@ -197,6 +197,11 @@ class DielectricPredictor(nn.Module):
         # 新增：将第二个输出约束为 sigma_soil (范围 0.05 到 25)
         sigma_soil = 0.001 + torch.nn.functional.softplus(logits[..., 1])
         # sigma_soil = 0.001 + 24.999 * torch.sigmoid(logits[..., 1])
+        # 🌟 关键修复：增加物理上限，防止发生 float32 溢出导致 NaN
+        # Dobson 模型的 beta 一般在 0.1 ~ 1.5 之间，绝不可能超过 10
+        beta = torch.clamp(beta, max=10.0) 
+        # 土壤电导率即使是极度盐碱地，极值也很难超过 30 S/m
+        sigma_soil = torch.clamp(sigma_soil, max=30.0)
         
         # 组合并返回 (覆盖原本返回复介电常数的位置)
         return torch.stack([beta, sigma_soil], dim=-1), logits
@@ -269,8 +274,11 @@ class RoughnessPredictor(nn.Module):
 # =======================================================================
 # Physics-Informed Loss Function (Numerically Stabilized)
 # =======================================================================
+# def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex_surf, eps_complex_all, PR_obs, eps_M09_surf_real,
+#                              lamda_bound_loss=10, lamda_structure_loss=5, lamda_PR_loss=1000):
 def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex_surf, eps_complex_all, PR_obs, eps_M09_surf_real,
-                             lamda_bound_loss=10, lamda_structure_loss=5, lamda_PR_loss=1000):
+                             beta_pred_surf=None, time_dim=None, patch_dim=None, # 🌟 新增参数
+                             lamda_bound_loss=10, lamda_structure_loss=5, lamda_PR_loss=1000, lamda_tv_loss=10): # 🌟 新增 TV Loss 权重
     # 1. Base data fitting error (RMSE) with epsilon protection for zero-gradients
     rmse_h = torch.sqrt(nn.MSELoss()(TB_sim_h, TB_obs_h) + 1e-8)
     rmse_v = torch.sqrt(nn.MSELoss()(TB_sim_v, TB_obs_v) + 1e-8)
@@ -290,8 +298,8 @@ def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex
     # --- 保留原有的基础物理边界约束（针对所有层） ---
     bound_loss_general = torch.mean(torch.relu(EPS_REAL_MIN - eps_real)) + torch.mean(torch.relu(-eps_imag))
     
-    # === 新增：限制虚部/实部的比值 (即 eps_imag <= 1.05 * eps_real) ===
-    ratio_loss = torch.mean(torch.relu(eps_imag - 1.05 * eps_real))
+    # === 新增：限制虚部/实部的比值 (即 eps_imag <= 1.0 * eps_real) ===
+    ratio_loss = torch.mean(torch.relu(eps_imag - 1.0 * eps_real))
     
     # --- 新增：仅针对表层实部的 M09 ±50% 约束 ---
     lower_bound_surf = 0.5 * eps_M09_surf_real
@@ -309,8 +317,22 @@ def physics_constrained_loss(TB_obs_h, TB_obs_v, TB_sim_h, TB_sim_v, eps_complex
     structure_loss = torch.mean(torch.relu(lower_bound - eps_imag)) + \
                      torch.mean(torch.relu(eps_imag - upper_bound))
                      
+    # === 🌟 4. 新增：时间平滑正则化 (Temporal Total Variation Loss) ===
+    tv_loss = 0.0
+    if beta_pred_surf is not None and time_dim is not None and patch_dim is not None:
+        # beta_pred_surf 原本是被展平的 [time_dim * patch_dim, 2]
+        # 我们需要将其恢复为 [time_dim, patch_dim, 2] 以便进行时间维度的错位差分计算
+        beta_2d = beta_pred_surf.view(time_dim, patch_dim, -1)
+        
+        # 计算相邻时间步之间的绝对差值
+        time_diff = beta_2d[1:, :, :] - beta_2d[:-1, :, :]
+        
+        # 对差值求平均作为惩罚项（差异越大，惩罚越重）
+        tv_loss = torch.mean(torch.abs(time_diff))
+    # ===================================================================
+                     
     # Total loss function
-    total_loss = rmse_loss + lamda_bound_loss* bound_loss + lamda_structure_loss * structure_loss + lamda_PR_loss * PR_loss
+    total_loss = rmse_loss + lamda_bound_loss * bound_loss + lamda_structure_loss * structure_loss + lamda_PR_loss * PR_loss + lamda_tv_loss * tv_loss
     return total_loss, rmse_loss, PR_loss
 
 
@@ -554,8 +576,10 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     net_rough.eval()
     
     best_loss_stage1 = float('inf')
+    baseline_loss_stage1 = float('inf')  # 🌟 新增：专门用于判定早停的基准 Loss
     best_diel_weights = None
     patience_counter = 0
+    min_delta_pct = 0.01  # 🌟 新增：最小下降百分比阈值 (0.01 代表 1%)。可根据需求调大或调小
 
     for epoch in range(epochs):
         optimizer_diel.zero_grad()
@@ -590,7 +614,8 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
                 tb_h_sim, tb_v_sim, 
                 eps_pred_surf, eps_pred_all,
                 PR_obs, eps_M09_surf_real, 
-                lamda_bound_loss=10, lamda_structure_loss=0,lamda_PR_loss=1000
+                beta_pred_surf=beta_pred_surf, time_dim=time_dim, patch_dim=patch_dim, # 🌟 传入网络预测的 beta 和维度
+                lamda_bound_loss=10, lamda_structure_loss=0, lamda_PR_loss=1000, lamda_tv_loss=10.0 # 🌟 设定时间平滑权重（可根据实际情况调参）
             )
         
         loss.backward()
@@ -603,13 +628,18 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         scheduler_diel.step(current_loss)
         loss_array_stage1.append(current_rmse)
         
-        # Determine the best model based on pure brightness temperature error
+        # === 🌟 核心修改开始 ===
+        # 1. 记录绝对最优权重：只要有一丁点下降，就更新 best_loss_stage1 并保存网络权重
         if current_rmse < best_loss_stage1:
-            patience_counter = 0 
             best_loss_stage1 = current_rmse
             best_diel_weights = copy.deepcopy(net_diel.state_dict())
+        # 2. 早停耐心值判定：计算相比于 baseline 是否下降了足够多的比例 (比如 1%)
+        if current_rmse < baseline_loss_stage1 * (1.0 - min_delta_pct):
+            baseline_loss_stage1 = current_rmse  # 更新显著下降基准线
+            patience_counter = 0                 # 只有显著下降才重置耐心值
         else:
-            patience_counter += 1
+            patience_counter += 1                # 否则继续累计无聊的迭代次数
+        # === 🌟 核心修改结束 ===
             
         if epoch % 2000 == 0 or epoch == epochs - 1:
             current_lr = optimizer_diel.param_groups[0]['lr']
@@ -669,7 +699,8 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
                 tb_h_sim, tb_v_sim, 
                 eps_pred_surf, eps_pred_all,
                 PR_obs, eps_M09_surf_real, 
-                lamda_bound_loss=10, lamda_structure_loss=0, lamda_PR_loss=1000
+                beta_pred_surf=beta_pred_surf, time_dim=time_dim, patch_dim=patch_dim,
+                lamda_bound_loss=10, lamda_structure_loss=0, lamda_PR_loss=1000, lamda_tv_loss=0.0 # 🌟 Stage 2 只优化粗糙度，介电常数已固定，设为 0
             )
         
         loss.backward()
@@ -732,7 +763,8 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
             t_snowdp, t_lai, t_sai, 
             t_wf_clay, t_wf_sand, t_wf_silt, t_BD_all, t_porsl, 
             t_sat_theta, t_sat_fghz,
-            final_eps_surf, final_eps_all, final_hr
+            final_eps_surf, final_eps_all, final_hr,
+            calc_all_teff=True  # 🌟 关键：在此处打开开关，只在这最后一次前向传播中计算 Wilheit
         )
         t_eff_array = rtm_model.t_eff[0]
         r_s_h, r_s_v = rtm_model.r_s[0], rtm_model.r_s[1]
@@ -741,6 +773,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         t_eff_wilheit_v = rtm_model.t_eff_wilheit[1]
         t_eff_holmes = rtm_model.t_eff_holmes[0]
         t_eff_wigneron = rtm_model.t_eff_wigneron[0]
+        eps_soil_after_frz_and_desert = rtm_model.eps_soil_after_frz_and_desert
 
     obs_tb_h_exp = np.repeat(obs['tb_h'], patch_dim)
     obs_tb_v_exp = np.repeat(obs['tb_v'], patch_dim)
@@ -782,9 +815,11 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         "sigma_surf": final_beta_surf[:, 1].cpu().numpy(),  # 列名改为 sigma_surf_pred
         "sigma_surf_D85": sigma_eff_org.cpu().numpy(),
         
+        "eps_surf_r_fd": eps_soil_after_frz_and_desert.real.cpu().numpy(),
         "eps_surf_r": final_eps_surf.real.cpu().numpy(),
         "eps_surf_r_M09": eps_surf_M09.real.cpu().numpy(),
         "eps_surf_r_D85": eps_surf_D85.real.cpu().numpy(),
+        "eps_surf_i_fd": eps_soil_after_frz_and_desert.imag.cpu().numpy(),
         "eps_surf_i": final_eps_surf.imag.cpu().numpy(),
         "eps_surf_i_M09":eps_surf_M09.imag.cpu().numpy(),
         "eps_surf_i_D85":eps_surf_D85.imag.cpu().numpy(),
@@ -845,7 +880,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
         }
     ).to_csv(os.path.join(output_dir, f"lat_{ease_lat}_lon_{ease_lon}_soil_dielectric_data_11layers.csv"),
               index=False, float_format="%.6f")
-    print('Dielectric constant related data has been outputted.\n')
+    print('Dielectric constant related data has been outputted.')
     arr_base = t_eff_array.cpu().numpy() if hasattr(t_eff_array, "cpu") else t_eff_array
     # 计算 RMSE 的闭包函数
     def calc_rmse(arr1, arr2):
@@ -865,7 +900,7 @@ def run_step_5_2_calibration(result, ease_lat, ease_lon, output_dir):
     print(f"  -> RMSE(t_eff_wilheit_v vs t_eff_array): {rmse_wilheit_v:.4f} K")
     print(f"  -> RMSE(t_eff_holmes    vs t_eff_array): {rmse_holmes:.4f} K")
     print(f"  -> RMSE(t_eff_wigneron  vs t_eff_array): {rmse_wigneron:.4f} K")
-    print("================================================================")
+    print("================================================================\n")
     
     return best_loss_stage2
 
@@ -876,7 +911,7 @@ if __name__ == "__main__":
     patch_map_file = '/home/liusy/storage_global_veg_wigneron/patch_map_EASE_open_lands.csv' 
     nc_dir = '/home/liusy/CoLM/outputs/global_veg_wigneron/forward_inputs_folder'
     output_dir = "/home/liusy/storage_global_veg_wigneron/tb_calibrate_try_1"
-    csv_files = open('csv_files_list_for_training.csv', encoding='utf-8').read().splitlines()[:10]
+    csv_files = open('csv_files_list_for_training.csv', encoding='utf-8').read().splitlines()
     # 定义输出结果文件
     output_result_csv = 'grid_loss_results.csv'
     
@@ -892,7 +927,7 @@ if __name__ == "__main__":
             writer.writerow(['target_csv', 'best_loss'])
 
     for grid_id in range(len(csv_files)):
-        # try:
+        try:
             target_csv = csv_files[grid_id]
             ease_lat, ease_lon = map(float, os.path.basename(target_csv).split('_')[1:4:2])
             print(f"Processing grid file: {target_csv} (Longitude: {ease_lon}, Latitude: {ease_lat})")
@@ -905,9 +940,9 @@ if __name__ == "__main__":
                 writer.writerow([target_csv, best_loss])
             
             # break
-        # except:
-        #     print(f'Error in {target_csv}\n')
-        #     continue
+        except:
+            print(f'Error in {target_csv}\n')
+            continue
            
         
         
