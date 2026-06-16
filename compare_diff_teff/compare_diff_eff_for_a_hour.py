@@ -115,6 +115,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     f = sat_fghz * 1e9
     lam = rtm_model.C / f
     lamcm = lam * 100.0
+    omega = 2.0 * np.pi * f  # <--- 新增这行，计算角频率 omega
 
     # ==================================================
     # 4. 大 Batch 喂给 GPU 并进行变量反推计算
@@ -130,7 +131,8 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         't_deep': [], 
         't_soi_max': [], 't_soi_min': [], # <--- 新增：10层土壤最大温度位置
         'eps_surf_real': [], 'eps_surf_imag': [],
-        'C_lv_two': [], 'C_holmes2006': [], 'C_inverted_wilheit': [], 'b_param_inverted': [], 'dz_surf_inverted': []
+        'C_lv_two': [], 'C_holmes2006': [], 'C_wigneron': [],
+        'C_inverted_wilheit': [], 'b_param_inverted': [], 'dz_surf_inverted': []
     }
     
     # 动态加入 10层土壤温度键，会自动排在 dz_surf_inverted 之后
@@ -175,6 +177,11 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         
         eps = rtm_model.diel_soil_M09(wc_all, t_soi - rtm_model.tfrz, clay_all, f)
         eps_surf = rtm_model.diel_soil_M09(wc_surf, t_surf - rtm_model.tfrz, clay_surf_pct, f)
+
+        # ew_all = rtm_model.diel_water_soil(-1, wc_all, t_soi - rtm_model.tfrz, sand_all, clay_all, bd_all_tensor / 1000.0, 0.0, f, omega)
+        # eps = rtm_model.diel_soil_D85(ew_all, wc_all, sand_all, clay_all, bd_all_tensor / 1000.0)
+        # ew_surf = rtm_model.diel_water_soil(-1, wc_surf, t_surf - rtm_model.tfrz, sand_surf_pct, clay_surf_pct, bd_surf, 0.0, f, omega)
+        # eps_surf = rtm_model.diel_soil_D85(ew_surf, wc_surf, sand_surf_pct, clay_surf_pct, bd_surf)
         
         t_lam = torch.full((t_soi.shape[0],), lam, dtype=torch.float32, device=device)
         t_theta = torch.full((t_soi.shape[0],), sat_theta, dtype=torch.float32, device=device)
@@ -200,7 +207,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
             depth_90 = cdz_prev + (0.9 - cw_prev) / weight_diff * dz_i
             
             teff_lv_two, C_lv_two = rtm_model.eff_soil_temp_Lv_two(wtot, t_surf, t_deep, eps_surf, t_lam, return_C=True)
-            teff_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep)
+            teff_wigneron, C_wigneron = rtm_model.eff_soil_temp_Wigneron2001(wc_surf, t_surf, t_deep, return_C=True)
             
             teff_holmes2006, C_holmes2006 = rtm_model.eff_soil_temp_Holmes2006(wc_surf, eps_surf, t_surf, t_deep, return_C=True)
             teff_wigneron2008 = rtm_model.eff_soil_temp_Wigneron2008(wc_surf, t_surf, t_deep, clay_surf, bd_surf)
@@ -259,6 +266,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         
         out_dict['C_lv_two'].append(C_lv_two.cpu().numpy())
         out_dict['C_holmes2006'].append(C_holmes2006.cpu().numpy())
+        out_dict['C_wigneron'].append(C_wigneron.cpu().numpy())
         out_dict['C_inverted_wilheit'].append(C_inverted.cpu().numpy())
         out_dict['b_param_inverted'].append(b_param_inverted.cpu().numpy())
         out_dict['dz_surf_inverted'].append(dz_surf_inverted.cpu().numpy())
@@ -450,6 +458,6 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
 if __name__ == "__main__":
     output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_2'
     t0 = time.time()
-    for month in range(6, 9):
+    for month in range(1, 13, 3):
         main(2016, month, 1, 0, output_dir=output_dir)
         print(f"Month {month} completed in {time.time()-t0:.2f} seconds")
