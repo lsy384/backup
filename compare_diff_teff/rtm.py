@@ -533,7 +533,7 @@ class DifferentiableRTM(nn.Module):
         eps_i = torch.abs(eps_surf.imag)
         
         # 2003-2004 interannual calibration parameters
-        b_param = 0.05      # 0.87
+        b_param = 0.87      # 0.87
         eps0_param = 0.08
         # --- 修改部分开始 ---
         # 使用 torch.where 根据 wc_surf 的值逐元素初始化 eps0_param  #没有好多少在极低湿度下
