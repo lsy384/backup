@@ -289,7 +289,7 @@ def run_step_5_2_calibration(result, target_patch_idx, patch_lat, patch_lon, out
     clay_all = (t_wf_clay / t_wf_total) * 100.0
     
     # === 4. 初始化模型 ===
-    rtm_model = DifferentiableRTM(def_da_rtm_diel=4, def_da_rtm_rough=0, def_da_rtm_veg=0, 
+    rtm_model = DifferentiableRTM(def_da_rtm_diel=3, def_da_rtm_rough=0, def_da_rtm_veg=0, 
                                   num_grids=num_samples, maxsnl=maxsnl).to(device)
     
     # === 计算 M09 先验知识 ===
@@ -476,8 +476,11 @@ if __name__ == "__main__":
     output_dir="/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff_for_open_lands/results_try_for_a_patch"
     
     # ======= 设置目标网格和想要提取的 Patch 索引 =======
-    TARGET_LAT, TARGET_LON = [31.62478,2.053942]
-    TARGET_PATCH_INDEX = 0  # 0表示该网格下的第1个patch，1表示第2个，以此类推
+    # TARGET_LAT, TARGET_LON = [31.62478,2.053942]
+    # TARGET_LAT, TARGET_LON = [30.966091,7.282158]
+    TARGET_LAT, TARGET_LON = [21.836075,23.713694]
+    
+    TARGET_PATCH_INDEX = 1  # 0表示该网格下的第1个patch，1表示第2个，以此类推
     # ===================================================
 
     print("正在加载全局 NC 索引表和 Patch 映射表...")
