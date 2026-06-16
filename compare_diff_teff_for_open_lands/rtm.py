@@ -279,8 +279,8 @@ class DifferentiableRTM(nn.Module):
             # 引入网络直接预测的各项中间变量计算表层介电常数 (直接使用外部传进来的 _surf)
             eps_soil_nd = self.diel_soil_Debye_framework(liq_surf, f, 
                                              znd_surf, zkd_surf, zxmvt_surf, zep0b_surf, ztaub_surf, zsigmab_surf, zep0u_surf, ztauu_surf, zsigmau_surf,)
-            eps_soil_nd_backup = eps_soil_nd.clone()
-            self.eps_soil_nd = eps_soil_nd
+        eps_soil_nd_backup = eps_soil_nd.clone()
+        self.eps_soil_nd = eps_soil_nd
         eps_soil_nd = eps_soil_nd*(1.-ffrz) + eps_f*ffrz
         
         eps_soil_d_real = torch.full_like(liq_surf, 2.53) + (2.79 - 2.53)/(1 + (fghz/0.27)**2)
