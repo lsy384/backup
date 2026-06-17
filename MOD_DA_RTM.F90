@@ -91,6 +91,8 @@ CONTAINS
       real(r8), intent(out) :: tb_tov_v                         ! brightness temperature of vegetation (consider snow) for V- polarization
 
 !----------------------- Local Variables -------------------------------
+      real(r8) :: liq_soi(nl_soil)            ! liquid volumetric water content in layers [m3/m3]
+      real(r8) :: ice_soi(nl_soil)            ! ice volumetric water content in layers [m3/m3]
       logical  :: is_low_veg                  ! flag for low vegetation
       real(r8) :: dz_soisno(maxsnl+1:nl_soil) ! liquid water in layers [kg/m2]
       integer  :: lb                          ! lower bound of arrays
@@ -147,6 +149,11 @@ CONTAINS
       ! caculate liquid/ice volumetric water (first two layers)
       liq_surf = (wliq_soisno(1) + wliq_soisno(2))/(0.0451*denh2o)
       ice_surf = (wice_soisno(1) + wice_soisno(2))/(0.0451*denice)
+      ! calculate liquid/ice volumetric water profile for all soil layers
+      DO i = 1, nl_soil
+         liq_soi(i) = wliq_soisno(i) / (dz_soisno(i)*denh2o)
+         ice_soi(i) = wice_soisno(i) / (dz_soisno(i)*denice)
+      END DO
 
       ! calculate lower bound of snow
       lb = 0
@@ -175,14 +182,9 @@ CONTAINS
 !#############################################################################
 ! soil module
 !#############################################################################
-         ! CALL soil(&
-         !    patchclass, &
-         !    t_surf, t_deep, &
-         !    liq_surf, ice_surf, &
-         !    wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, &
-         !    r_r, tb_soil)
          CALL soil(&
-            patchclass, nl_soil, dz_soi(1:nl_soil), t_soisno(1:nl_soil), h2osoi(1:nl_soil), wf_clay(1:nl_soil), &
+            patchclass, nl_soil, dz_soi(1:nl_soil), t_soisno(1:nl_soil), &
+            liq_soi(1:nl_soil), ice_soi(1:nl_soil), wf_sand(1:nl_soil), wf_clay(1:nl_soil), BD_all(1:nl_soil), porsl(1:nl_soil), &
             t_surf, t_deep, &
             liq_surf, ice_surf, &
             wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, &
@@ -426,14 +428,8 @@ CONTAINS
 
 !-----------------------------------------------------------------------
 
-   ! SUBROUTINE soil( &
-   !    patchclass, &
-   !    t_surf, t_deep, &
-   !    liq_surf, ice_surf, &
-   !    wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, &
-   !    r_r, tb_soil)
    SUBROUTINE soil( &
-      patchclass, nl_soil, dz_soi, t_soi, wc_soi, wf_clay, &
+      patchclass, nl_soil, dz_soi, t_soi, liq_soi, ice_soi, wf_sand, wf_clay, BD_all, porsl, &
       t_surf, t_deep, &
       liq_surf, ice_surf, &
       wf_sand_surf, wf_clay_surf, BD_all_surf, porsl_surf, &
@@ -454,12 +450,15 @@ CONTAINS
 
 !------------------------ Dummy Argument ------------------------------
       integer, intent(in)   :: patchclass               ! land cover class
-
       integer, intent(in)   :: nl_soil                  ! number of soil layers
       real(r8), intent(in)  :: dz_soi(nl_soil)          ! soil layer thickness profile (m)
       real(r8), intent(in)  :: t_soi(nl_soil)           ! soil temperature profile (K)
-      real(r8), intent(in)  :: wc_soi(nl_soil)          ! soil moisture profile (m3/m3)
+      real(r8), intent(in)  :: liq_soi(nl_soil)         ! liquid soil moisture profile (m3/m3)
+      real(r8), intent(in)  :: ice_soi(nl_soil)         ! ice soil moisture profile (m3/m3)
+      real(r8), intent(in)  :: wf_sand(nl_soil)         ! sand fraction profile (%)
       real(r8), intent(in)  :: wf_clay(nl_soil)         ! clay fraction profile (%)
+      real(r8), intent(in)  :: BD_all(nl_soil)          ! bulk density profile (kg/m3)
+      real(r8), intent(in)  :: porsl(nl_soil)           ! porosity profile
 
       real(r8), intent(in)  :: t_surf                   ! soil temperature at surface (C)
       real(r8), intent(in)  :: t_deep                   ! soil temperature at deep layer (C)
@@ -473,6 +472,13 @@ CONTAINS
       real(r8), intent(out) :: tb_soil(2)               ! brightness temperature of soil
 
 !----------------------- Local Variables -------------------------------
+      complex(r8) :: eps_prof(nl_soil)          ! dielectric constant profile for multi-layer schemes
+      complex(r8) :: ew_layer                   ! dielectric constant of water for layer
+      real(r8)    :: ffrz_layer                 ! fraction of frozen soil for layer
+      logical     :: is_desert_layer            ! flag for desert soil for layer
+      real(r8)    :: BD_layer_gcm3              ! bulk density (g/cm3) for layer
+      integer     :: i_layer
+
       real(r8)    :: t_eff(2)                   ! effective temperature for H and V polarizations, [K]
       complex(r8) :: eps_soil                   ! dielectric constant of soil for H and V polarizations
       real(r8)    :: r_s(2)                     ! smooth surface reflectivity for H and V polarizations
@@ -496,9 +502,6 @@ CONTAINS
       ELSE
         ffrz = ice_surf / (liq_surf + ice_surf)
       ENDIF
-
-      ! caculate effective temperature
-      ! CALL eff_soil_temp(liq_surf, t_surf, t_deep, t_eff)
 
       ! caculate dielectric constant of soil (mixture medium)
       IF (is_desert) THEN
@@ -535,21 +538,58 @@ CONTAINS
          ENDIF
       END IF
 
-      ! --- 新增：有效温度方案选择开关 ---
+      ! --- 仅在 Wilheit (0) 或 Lv2014 (3) 方案下才计算每一层的介电常数剖面 ---
+      IF (DEF_DA_RTM_teff == 0 .or. DEF_DA_RTM_teff == 3) THEN
+         DO i_layer = 1, nl_soil
+            is_desert_layer = .false.
+            IF (liq_soi(i_layer) < 0.02 .and. wf_sand(i_layer) > 90) THEN
+               is_desert_layer = .true.
+            END IF
+            IF (liq_soi(i_layer) + ice_soi(i_layer) <= 0.0d0) THEN
+               ffrz_layer = 0.0d0
+            ELSE
+               ffrz_layer = ice_soi(i_layer) / (liq_soi(i_layer) + ice_soi(i_layer))
+            END IF
+            IF (is_desert_layer) THEN
+               eps_prof(i_layer) = 2.53 + (2.79 - 2.53)/(1 - jj*(fghz/0.27)) + jj*0.002
+            ELSE
+               BD_layer_gcm3 = BD_all(i_layer) / 1000.0_r8
+               IF (ffrz_layer > 0.95) THEN
+                  CALL diel_ice(t_soi(i_layer)-tfrz, ew_layer)
+               ELSE
+                  CALL diel_water(2, liq_soi(i_layer), t_soi(i_layer)-tfrz, wf_sand(i_layer), wf_clay(i_layer), BD_layer_gcm3, sal_soil, ew_layer)
+               END IF
+
+               IF (DEF_DA_RTM_diel == 0) THEN
+                  CALL diel_soil_W80 (ew_layer, t_soi(i_layer)-tfrz, liq_soi(i_layer), wf_sand(i_layer), wf_clay(i_layer), porsl(i_layer), eps_prof(i_layer))
+                  eps_prof(i_layer) = eps_prof(i_layer)*(1.-ffrz_layer) + eps_f*ffrz_layer
+               ELSE IF (DEF_DA_RTM_diel == 1) THEN
+                  CALL diel_soil_D85 (ew_layer, liq_soi(i_layer), ice_soi(i_layer), wf_sand(i_layer), wf_clay(i_layer), BD_layer_gcm3, eps_prof(i_layer))
+               ELSE IF (DEF_DA_RTM_diel == 2) THEN
+                  CALL diel_soil_M04 (liq_soi(i_layer), wf_clay(i_layer), eps_prof(i_layer))
+                  eps_prof(i_layer) = eps_prof(i_layer)*(1.-ffrz_layer) + eps_f*ffrz_layer
+               ELSE IF (DEF_DA_RTM_diel == 3) THEN
+                  CALL diel_soil_M09 (liq_soi(i_layer), t_soi(i_layer)-tfrz, wf_clay(i_layer), eps_prof(i_layer))
+                  eps_prof(i_layer) = eps_prof(i_layer)*(1.-ffrz_layer) + eps_f*ffrz_layer
+               ENDIF
+            END IF
+         END DO
+      END IF
+
+      ! --- 执行有效温度方案计算 ---
       IF (DEF_DA_RTM_teff == 0) THEN
-         ! 0: Wilheit (1975) 
-         CALL eff_soil_temp_Wilheit(nl_soil, dz_soi, t_soi, wc_soi, wf_clay, t_eff)
+         !0: Wilheit (1975) 
+         CALL eff_soil_temp_Wilheit(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
       ELSE IF (DEF_DA_RTM_teff == 1) THEN
-         ! 1: Wigneron (2001) 
+         !1: Wigneron (2001) 
          CALL eff_soil_temp_Wigneron(liq_surf, t_surf, t_deep, t_eff)
       ELSE IF (DEF_DA_RTM_teff == 2) THEN
-         ! 2: Holmes (2006) - 依赖表面混合介电常数 eps_soil
+         !2: Holmes (2006) - 依赖表面混合介电常数 eps_soil
          CALL eff_soil_temp_Holmes(t_surf, t_deep, eps_soil, t_eff)
       ELSE IF (DEF_DA_RTM_teff == 3) THEN
-         ! 3: Lv (2014)
-         CALL eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, wc_soi, wf_clay, t_eff)
+         !3: Lv (2014)
+         CALL eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
       END IF
-      ! ----------------------------------
 
       ! caculate smooth surface reflectivity
       CALL smooth_reflectivity(eps_soil, r_s)
@@ -612,7 +652,7 @@ CONTAINS
    END SUBROUTINE eff_soil_temp_Holmes
 
 !-----------------------------------------------------------------------
-   SUBROUTINE eff_soil_temp_Wilheit(nl_soil, dz_soi, t_soi, wc_soi, wf_clay, t_eff)
+   SUBROUTINE eff_soil_temp_Wilheit(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
 !-----------------------------------------------------------------------
 ! DESCRIPTION:
 !   Calculate the effective temperature of soil based on Wilheit (1975)
@@ -626,8 +666,7 @@ CONTAINS
       integer, intent(in)     :: nl_soil
       real(r8), intent(in)    :: dz_soi(:)
       real(r8), intent(in)    :: t_soi(:)
-      real(r8), intent(in)    :: wc_soi(:)
-      real(r8), intent(in)    :: wf_clay(:)
+      complex(r8), intent(in) :: eps_prof(:)
       real(r8), intent(out)   :: t_eff(2)
 
 !----------------------- Local Variables -------------------------------
@@ -646,8 +685,7 @@ CONTAINS
 
       DO i = 1, nl_soil
          zsoil_wil(i+1) = dz_soi(i)  ! Layer thickness in meters
-         ! Calculate dielectric constant for each layer using Mironov 2009
-         CALL diel_soil_M09(wc_soi(i), t_soi(i)-tfrz, wf_clay(i), eps_layer)
+         eps_layer = eps_prof(i)
          nref(i+1) = sqrt(eps_layer)
       END DO
 
@@ -887,7 +925,7 @@ CONTAINS
 !-----------------------------------------------------------------------
 
    !-----------------------------------------------------------------------
-   SUBROUTINE eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, wc_soi, wf_clay, t_eff)
+   SUBROUTINE eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
 !-----------------------------------------------------------------------
 ! DESCRIPTION:
 !   Calculate the effective temperature of soil based on Lv's multi-layer scheme.
@@ -906,8 +944,7 @@ CONTAINS
       integer, intent(in)     :: nl_soil        ! number of soil layers (e.g., 10)
       real(r8), intent(in)    :: dz_soi(:)      ! layer thickness profile (m)
       real(r8), intent(in)    :: t_soi(:)       ! soil temperature profile (K)
-      real(r8), intent(in)    :: wc_soi(:)      ! volumetric soil moisture profile (m3/m3)
-      real(r8), intent(in)    :: wf_clay(:)     ! gravimetric clay fraction profile (%)
+      complex(r8), intent(in) :: eps_prof(:)    ! dielectric constant profile
       real(r8), intent(out)   :: t_eff(2)       ! effective temperature for H and V polarizations [K]
 
 !----------------------- Local Variables -------------------------------
@@ -923,9 +960,8 @@ CONTAINS
       prod_term = 1.0_r8
 
       DO i = 1, nl_soil
-         ! 1. Calculate dielectric constant for current layer using Mironov 2004 model
-         ! CALL diel_soil_M04(wc_soi(i), wf_clay(i), eps)
-         CALL diel_soil_M09(wc_soi(i), t_soi(i)-tfrz, wf_clay(i), eps) ! alternative: Mironov 2009 model
+         ! 1. Get dielectric constant for current layer
+         eps = eps_prof(i)
 
          eps_r = real(eps)
          eps_i = abs(aimag(eps)) ! use absolute value to ensure positive attenuation
