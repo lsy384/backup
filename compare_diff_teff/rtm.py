@@ -524,7 +524,7 @@ class DifferentiableRTM(nn.Module):
             return teff, C
         return teff
     
-    def eff_soil_temp_Holmes2006(self, wc_surf, eps_surf, t_surf, t_deep, return_C=False):
+    def eff_soil_temp_Holmes2006(self, eps_surf, t_surf, t_deep, return_C=False):
         """
         Holmes 2006 model (基于介电常数比值的参数化)
         eps_surf: 表层复介电常数 (complex)
