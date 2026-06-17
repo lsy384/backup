@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import calendar
 import time
 from concurrent.futures import ProcessPoolExecutor
-
+import sys
 # Import the RTM model containing the added Teff schemes
 from rtm import DifferentiableRTM
 
@@ -34,6 +34,7 @@ def read_single_nc(args):
         
         t_soisno = dataset.variables['t_soisno'][time_idx, valid_mask, :]
         wliq_soisno = dataset.variables['wliq_soisno'][time_idx, valid_mask, :]
+        h2osoi = dataset.variables['h2osoi'][time_idx, valid_mask, :]
         wf_clay = dataset.variables['wf_clay'][valid_mask, :]
         wf_sand = dataset.variables['wf_sand'][valid_mask, :]  # 读取沙粒比例
         
@@ -49,7 +50,7 @@ def read_single_nc(args):
         return {
             'lon': lon, 'lat': lat, 'patchclass': patchclass,
             't_soisno': t_soisno, 'wliq_soisno': wliq_soisno,
-            'wf_clay': wf_clay, 'wf_sand': wf_sand, 'bd_all': bd_all
+            'h2osoi': h2osoi, 'wf_clay': wf_clay, 'wf_sand': wf_sand, 'bd_all': bd_all
         }
     except Exception as e:
         return None
@@ -95,6 +96,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     lat_all = np.concatenate([r['lat'] for r in results])
     patchclass_all = np.concatenate([r['patchclass'] for r in results])
     
+    h2osoi_all = np.concatenate([r['h2osoi'] for r in results])
     t_soisno_all = np.concatenate([r['t_soisno'] for r in results])
     wliq_soisno_all = np.concatenate([r['wliq_soisno'] for r in results])
     wf_clay_all = np.concatenate([r['wf_clay'] for r in results])
@@ -144,12 +146,20 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
         
         t_soi = torch.tensor(t_soisno_all[i:end_idx, 5:], dtype=torch.float32, device=device)
         wliq_soi = torch.tensor(wliq_soisno_all[i:end_idx, 5:], dtype=torch.float32, device=device)
+        
+        h2osoi = torch.tensor(h2osoi_all[i:end_idx, :], dtype=torch.float32, device=device)
         clay_all = torch.tensor(wf_clay_all[i:end_idx, :], dtype=torch.float32, device=device)
         sand_all = torch.tensor(wf_sand_all[i:end_idx, :], dtype=torch.float32, device=device)
         bd_all_tensor = torch.tensor(bd_all_all[i:end_idx, :], dtype=torch.float32, device=device)
 
         dz_soi = rtm_model.dz_soi.unsqueeze(0).expand(t_soi.shape[0], -1)
-        wc_all = wliq_soi / (dz_soi * 100.0)
+        wc_all = wliq_soi / (dz_soi * 1000.0)
+        
+        print('wc_all.shape, h2osoi.shape',wc_all.shape, h2osoi.shape)
+        print(wc_all[:20,0])
+        print(h2osoi[:20,0])
+        sys.exit()
+        
         
         # wtot = 0.0175 + 0.0276
         # t_surf = ((t_soi[:, 0]*0.0175 + t_soi[:, 1]*0.0276) / wtot)
@@ -456,7 +466,7 @@ def main(target_year, target_month, target_day, target_hour, output_dir):
     # print(f"Spatial discrepancy profile plot successfully generated: {plot_filename}")
 
 if __name__ == "__main__":
-    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_2'
+    output_dir = '/home/liusy/research_lists/2026-06-01_research_list/compare_diff_teff/results_try_3'
     t0 = time.time()
     for month in range(1, 13, 3):
         main(2016, month, 1, 0, output_dir=output_dir)
