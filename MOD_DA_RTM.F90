@@ -19,6 +19,7 @@ MODULE MOD_DA_RTM
    USE MOD_SPMD_Task
    USE MOD_Vars_Global, only: nl_soil, nl_lake, N_land_classification
    USE MOD_Namelist
+   USE i2em_module      !<==== 【添加这一行】引入刚才我们封装的 I2EM 模块
    IMPLICIT NONE
    SAVE
 
@@ -489,6 +490,11 @@ CONTAINS
       complex(r8) :: eps_f = (5.0, 0.5)         ! dielectric constant of frozen soil
       real(r8)    :: sal_soil = 0.0             ! soil salinity (psu)
 
+      ! ===== 【添加以下 I2EM 专用变量】 =====
+      real(r8)    :: eh_i2em, ev_i2em           ! I2EM 计算的 H 和 V 极化发射率
+      real(r8)    :: rms_m, cl_m                ! 均方根高度和相关长度 (单位: 米)
+      ! ======================================
+
 !-----------------------------------------------------------------------
 
       ! whether this patch is desert
@@ -541,6 +547,7 @@ CONTAINS
 
       ! --- 仅在 Wilheit (0) 或 Lv2014 (3) 方案下才计算每一层的介电常数剖面 ---
       IF (DEF_DA_RTM_teff == 0 .or. DEF_DA_RTM_teff == 3) THEN
+         ! PRINT *, "Wilheit Teff needs to calculate soil diel"
          DO i_layer = 1, nl_soil
             is_desert_layer = .false.
             IF (liq_soi(i_layer) < 0.02 .and. wf_sand(i_layer) > 90) THEN
@@ -580,9 +587,11 @@ CONTAINS
       ! --- 执行有效温度方案计算 ---
       IF (DEF_DA_RTM_teff == 0) THEN
          !0: Wilheit (1975) 
+         ! PRINT *, "Call the Wilheit Teff"
          CALL eff_soil_temp_Wilheit(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
       ELSE IF (DEF_DA_RTM_teff == 1) THEN
          !1: Wigneron (2001) 
+         ! PRINT *, "Call the Wigneron Teff"
          CALL eff_soil_temp_Wigneron(liq_surf, t_surf, t_deep, t_eff)
       ELSE IF (DEF_DA_RTM_teff == 2) THEN
          !2: Holmes (2006) - 依赖表面混合介电常数 eps_soil
@@ -592,12 +601,37 @@ CONTAINS
          CALL eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
       END IF
 
-      ! caculate smooth surface reflectivity
-      CALL smooth_reflectivity(eps_soil, r_s)
+      ! --- 计算表面反射率 (Surface Reflectivity) ---
+      ! 假设通过 namelist 配置 DEF_DA_RTM_rough == 4 表示使用 I2EM 物理模型
+      IF (DEF_DA_RTM_rough == 4) THEN
+         ! 1. 准备 I2EM 粗糙度参数 
+         ! 原代码中粗糙度参数为 rgh_surf (通常单位为 cm)，I2EM 严格要求单位为米 (m)
+         rms_m = rgh_surf / 100.0_r8
+         ! 相关长度 (Correlation Length) 假设暂时固定为 0.10m，你也可以在 MOD_DA_Const 中定义 cl_surf 并在此传入
+         cl_m  = 0.10_r8  
+         ! 2. 调用 I2EM 模块 (类似 Python 的传参方式)
+         ! 注意：原模型中 theta 单位是弧度，需要转换为角度输入给 I2EM
+         CALL emissivity( &
+             freq_ghz      = fghz, &
+             rms_height_m  = rms_m, &
+             corr_length_m = cl_m, &
+             theta_deg     = theta * 180.0_r8 / pi, &
+             er_complex    = eps_soil, &
+             correl        = "exponential", &   ! 或根据实际地表改为 "gaussian"
+             eh            = eh_i2em, &
+             ev            = ev_i2em &
+         )
+         ! 3. 将发射率(Emissivity)转换为反射率(Reflectivity)
+         ! 根据基尔霍夫定律 (r = 1 - e)
+         r_r(1) = 1.0_r8 - eh_i2em
+         r_r(2) = 1.0_r8 - ev_i2em
+      ELSE
+         ! --- 原有的半经验反射率模型 (DEF_DA_RTM_rough = 0, 1, 2, 3) ---
+         CALL smooth_reflectivity(eps_soil, r_s)
+         CALL rough_reflectivity(is_desert, patchclass, r_s, r_r)
+      END IF
 
-      ! caculate rough surface reflectivity
-      CALL rough_reflectivity(is_desert, patchclass, r_s, r_r)
-
+      ! --- 最终亮度温度的计算 (沙漠需要增加体散射计算)---
       ! calculate brightness temperature
       IF (is_desert) THEN
          CALL desert(t_eff, r_r, eps_soil, tb_soil)
