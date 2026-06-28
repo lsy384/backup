@@ -409,7 +409,7 @@ CONTAINS
 !----------------------- Local Variables -------------------------------
       real(r8) :: t_sky = 2.7    ! cosmic ray radiation (K)
       real(r8) :: t_eq           ! equivalent layer temperature
-      real(r8) :: gossat
+      real(r8) :: gossat        ! 大气透过率
 
 !-----------------------------------------------------------------------
 
@@ -424,7 +424,7 @@ CONTAINS
       tb_au(:) = t_eq*(1.-gossat)
 
       ! downwelling radiation (brightness temperature) of atmosphere [1] eq(A2)
-      tb_ad(:) = t_eq*(1.-gossat) + t_sky*gossat
+      tb_ad(:) = t_eq*(1.-gossat) + t_sky*gossat !大气自身的下行辐射 + 穿透大气层的宇宙背景辐射
 
    END SUBROUTINE atm
 
@@ -494,14 +494,23 @@ CONTAINS
       real(r8)    :: eh_i2em, ev_i2em           ! I2EM 计算的 H 和 V 极化发射率
       real(r8)    :: rms_m, cl_m                ! 均方根高度和相关长度 (单位: 米)
       ! ======================================
+      
+      ! ===== 【添加连续介质统一发射率专用变量】 =====
+      real(r8)    :: a0_surf                    ! 表层相似性参数 (默认1.0代表无散射纯发射)
+      real(r8)    :: a0, r_surf, f_surf, Q_s_surf, k_s_surf, k_a_surf, g_surf, omega_surf
+      complex(r8) :: eps_grain                  ! 干土骨架(沙粒)的介电常数
+      real(r8)    :: y_R_surf
+      real(r8)    :: e_surf(2)                  ! 统一的 H 和 V 极化发射率
+      ! ==============================================
 
 !-----------------------------------------------------------------------
-
       ! whether this patch is desert
       is_desert = .false.
       IF (liq_surf < 0.02 .and. wf_sand_surf > 90) THEN
          is_desert = .true.
       END IF
+      ! --- 提前计算骨架颗粒(沙粒)介电常数 ---
+      eps_grain = 4 + jj*0.05
 
       ! calculate ratio of freezed soil
       IF (liq_surf + ice_surf <= 0.0d0) THEN
@@ -545,8 +554,8 @@ CONTAINS
          ENDIF
       END IF
 
-      ! --- 仅在 Wilheit (0) 或 Lv2014 (3) 方案下才计算每一层的介电常数剖面 ---
-      IF (DEF_DA_RTM_teff == 0 .or. DEF_DA_RTM_teff == 3) THEN
+      ! --- 仅在 Wilheit (0) 或 Lv2014 (3) or LIU 方案下才计算每一层的介电常数剖面 ---
+      IF (DEF_DA_RTM_teff == 0 .or. DEF_DA_RTM_teff == 3 .or. DEF_DA_RTM_teff == 4) THEN
          ! PRINT *, "Wilheit Teff needs to calculate soil diel"
          DO i_layer = 1, nl_soil
             is_desert_layer = .false.
@@ -585,6 +594,7 @@ CONTAINS
       END IF
 
       ! --- 执行有效温度方案计算 ---
+      a0_surf = 1.0_r8
       IF (DEF_DA_RTM_teff == 0) THEN
          !0: Wilheit (1975) 
          ! PRINT *, "Call the Wilheit Teff"
@@ -599,6 +609,9 @@ CONTAINS
       ELSE IF (DEF_DA_RTM_teff == 3) THEN
          !3: Lv (2014)
          CALL eff_soil_temp_Lv(nl_soil, dz_soi, t_soi, eps_prof, t_eff)
+      ELSE IF (DEF_DA_RTM_teff == 4) THEN
+         !4: Analytical continuous dual-stream solution
+         CALL eff_soil_temp_Analytical(nl_soil, dz_soi, t_soi, eps_prof, wf_sand, porsl, eps_grain, t_eff, a0_surf)
       END IF
 
       ! --- 计算表面反射率 (Surface Reflectivity) ---
@@ -631,15 +644,135 @@ CONTAINS
          CALL rough_reflectivity(is_desert, patchclass, r_s, r_r)
       END IF
 
-      ! --- 最终亮度温度的计算 (沙漠需要增加体散射计算)---
-      ! calculate brightness temperature
-      IF (is_desert) THEN
-         CALL desert(t_eff, r_r, eps_soil, tb_soil)
-      ELSE
-         tb_soil = t_eff * (1 - r_r)
-      END IF
+      ! ! --- 最终亮度温度的计算 (沙漠需要增加体散射计算)---
+      ! ! calculate brightness temperature
+      ! IF (is_desert) THEN
+      !    CALL desert(t_eff, r_r, eps_soil, tb_soil)
+      ! ELSE
+      !    tb_soil = t_eff * (1 - r_r)
+      ! END IF
+      ! --- 最终亮度温度的计算 (统一的体散射连续介质发射率模型) ---
+     CALL calc_tb_soil_unified(a0_surf, t_eff, r_r, tb_soil)
 
    END SUBROUTINE soil
+
+
+!-----------------------------------------------------------------------
+   SUBROUTINE calc_tb_soil_unified(a0_surf, t_eff, r_r, tb_soil)
+!-----------------------------------------------------------------------
+! DESCRIPTION:
+!   Calculate brightness temperature of soil using the unified continuous 
+!   volume scattering emission model based on DMT and dual-stream analytical solution.
+!-----------------------------------------------------------------------
+      USE MOD_Precision
+      USE MOD_Const_Physical
+      IMPLICIT NONE
+
+!------------------------ Dummy Argument ------------------------------
+      real(r8), intent(in)    :: a0_surf          ! 表层相似性参数 a_0 (直接从解析解模块传入)
+      real(r8), intent(in)    :: t_eff(2)         ! effective temperature for H and V polarizations [K]
+      real(r8), intent(inout) :: r_r(2)           ! rough surface reflectivity for H and V polarizations
+      real(r8), intent(out)   :: tb_soil(2)       ! brightness temperature of soil for H and V polarizations
+
+!----------------------- Local Variables -------------------------------
+      real(r8)    :: e_surf(2)                    ! 统一的 H 和 V 极化发射率
+!-----------------------------------------------------------------------
+
+      ! 1. 统一计算最终发射率 e 与亮度温度 Tb (基于传入的严格 a0_surf)
+      e_surf = (1.0_r8 - r_r) * (2.0_r8 * a0_surf) / ((1.0_r8 + a0_surf) - (1.0_r8 - a0_surf) * r_r)
+      tb_soil = t_eff * e_surf
+
+      ! 2. 修正粗糙表面反射率 r_r，供 forward 主程序中计算下行辐射的反射使用 (基尔霍夫定律)
+      r_r = 1.0_r8 - e_surf
+
+   END SUBROUTINE calc_tb_soil_unified
+
+
+!-----------------------------------------------------------------------
+  SUBROUTINE eff_soil_temp_Analytical(nl_soil, dz_soi, t_soi, eps_prof, wf_sand, porsl, eps_grain, t_eff, a0_surf)
+!-----------------------------------------------------------------------
+! DESCRIPTION:
+!   Calculate the effective temperature of soil based on the continuous 
+!   dual-stream analytical solution considering volume scattering.
+!-----------------------------------------------------------------------
+      USE MOD_Precision
+      USE MOD_Const_Physical
+      IMPLICIT NONE
+
+!------------------------ Dummy Argument ------------------------------
+      integer, intent(in)     :: nl_soil
+      real(r8), intent(in)    :: dz_soi(:)
+      real(r8), intent(in)    :: t_soi(:)
+      complex(r8), intent(in) :: eps_prof(:)
+      real(r8), intent(in)    :: wf_sand(:)      ! sand fraction profile (%)
+      real(r8), intent(in)    :: porsl(:)        ! porosity profile
+      complex(r8), intent(in) :: eps_grain       ! dielectric constant of dry grain (从外部传入)
+      real(r8), intent(out)   :: t_eff(2)
+      real(r8), intent(out)   :: a0_surf         ! <===【新增】输出第一层的相似性参数
+
+!----------------------- Local Variables -------------------------------
+      integer                 :: i
+      real(r8)                :: k_a, k_s, g_asym, omega_albedo
+      real(r8)                :: L_pen, mu_z, kappa_z, tau_z
+      real(r8)                :: r_sand, r_clay, r_j, f_j
+      real(r8)                :: y_R, Q_s
+      real(r8)                :: Pi_cum, a0
+      real(r8)                :: a_array(nl_soil)
+!-----------------------------------------------------------------------
+
+      ! 1. 基础介电常数颗粒属性准备
+      y_R = real((eps_grain - 1.0_r8) / (eps_grain + 2.0_r8))
+
+      ! 散射体等效半径基准 (m)
+      r_sand = 0.5e-3_r8
+      r_clay = 0.01e-3_r8
+
+      t_eff(1) = 0.0_r8
+      Pi_cum   = 0.0_r8
+
+      DO i = 1, nl_soil
+         ! 2. 吸收系数 ka,j
+         k_a = abs(k * aimag(sqrt(eps_prof(i)))) 
+         k_a = max(k_a, 1.0e-12_r8) ! 防止被0除
+
+         ! 3. 散射系数 ks,j 与 DMT 理论实现
+         r_j = r_clay + (r_sand - r_clay) * (wf_sand(i) / 100.0_r8)
+         f_j = (1.0_r8 - porsl(i)) * (wf_sand(i) / 100.0_r8)
+
+         Q_s = (8.0_r8 / 3.0_r8) * (k * r_j)**4 * (y_R**2) * &
+               ( ((1.0_r8 - f_j)**4) / ( ((1.0_r8 + 2.0_r8 * f_j)**2) * &
+               ((1.0_r8 - f_j * y_R)**1.5_r8) * ((1.0_r8 + 2.0_r8 * f_j * y_R)**0.5_r8) ) )
+         
+         k_s = (3.0_r8 * f_j / (4.0_r8 * r_j)) * Q_s
+
+         ! 4. 不对称因子 g_j
+         g_asym = 0.23_r8 * (k * r_j)**2
+
+         ! 5. 单散射反照率与相似性参数 (a_j)
+         omega_albedo = k_s / (k_s + k_a)
+         omega_albedo = min(max(omega_albedo, 0.0_r8), 0.9999_r8) ! 确保物理边界
+         
+         a_array(i) = sqrt((1.0_r8 - omega_albedo) / (1.0_r8 - omega_albedo * g_asym))
+
+         ! 6. 层内有效衰减系数与光学厚度
+         L_pen = a_array(i) / k_a
+         mu_z = sqrt(max(0.0_r8, 1.0_r8 - (sin(theta) / real(sqrt(eps_prof(i))))**2))
+         mu_z = max(mu_z, 0.001_r8)
+
+         kappa_z = 1.0_r8 / (mu_z * L_pen)
+         tau_z = kappa_z * dz_soi(i)
+
+         ! 7. 解析离散积分：累加有效温度
+         IF (i == 1) THEN
+             a0_surf = a_array(1)
+         END IF
+         t_eff(1) = t_eff(1) + t_soi(i) * sqrt(a_array(i) / a0) * exp(-Pi_cum) * (1.0_r8 - exp(-tau_z))
+         Pi_cum = Pi_cum + tau_z
+      END DO
+
+      t_eff(2) = t_eff(1)
+
+   END SUBROUTINE eff_soil_temp_Analytical
 
 
 !-----------------------------------------------------------------------
