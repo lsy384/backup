@@ -732,7 +732,7 @@ CONTAINS
 
       DO i = 1, nl_soil
          ! 2. 吸收系数 ka,j
-         k_a = abs(k * aimag(sqrt(eps_prof(i)))) 
+         k_a = abs(2 * k * aimag(sqrt(eps_prof(i)))) 
          k_a = max(k_a, 1.0e-12_r8) ! 防止被0除
 
          ! 3. 散射系数 ks,j 与 DMT 理论实现
