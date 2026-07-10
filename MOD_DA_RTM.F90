@@ -74,7 +74,7 @@ CONTAINS
       real(r8), intent(in)  :: t_soisno(maxsnl + 1:nl_soil)     ! soil temperature [K]
       real(r8), intent(in)  :: wliq_soisno(maxsnl + 1:nl_soil)  ! liquid water in layers [kg/m2]
       real(r8), intent(in)  :: wice_soisno(maxsnl + 1:nl_soil)  ! ice lens in layers [kg/m2]
-      real(r8), intent(in)  :: h2osoi(nl_soil)                  ! volumetric soil water in layers [m3/m3]
+      real(r8), intent(in)  :: h2osoi(nl_soil)                  ! volumetric soil water (solid+liquid) in layers [m3/m3]
       real(r8), intent(in)  :: snowdp                           ! snow depth [meter]
       real(r8), intent(in)  :: lai                              ! leaf area index
       real(r8), intent(in)  :: sai                              ! stem area index
